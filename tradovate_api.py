@@ -21,7 +21,12 @@ class TradovateClient:
         }
         response = requests.post(login_url, json=data)
         response.raise_for_status()
-        return response.json()['accessToken']
+       try:
+    return response.json()['accessToken']
+except KeyError:
+    print("❌ Auth failed:", response.status_code)
+    print("❌ Response:", response.text)
+    raise SystemExit("Authentication failed. Check your credentials.")
 
     def get_last_price(self, symbol="MNQU5"):
         url = f"{self.base_url}/md/lastquote/{symbol}"
