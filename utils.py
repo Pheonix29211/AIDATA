@@ -1,4 +1,4 @@
-from tvDatafeed import TvDatafeed, Interval
+from tvDatafeed import tvDatafeed, Interval
 import os
 
 tv = TvDatafeed(session=os.getenv("TV_SESSION"))
