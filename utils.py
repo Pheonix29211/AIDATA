@@ -1,14 +1,14 @@
 from tvDatafeed.tvDatafeed import TvDatafeed, Interval
 import os
+# Authenticate using TradingView credentials from environment variables
+tv = TvDatafeed(
+    username=os.getenv("TV_USERNAME"),
+    password=os.getenv("TV_PASSWORD")
+)
 
-tv = TvDatafeed(session=os.getenv("TV_SESSION"))
-
-def generate_signal():
-    try:
-        data = tv.get_hist(symbol='MNQU5', exchange='CME_MINI', interval=Interval.in_5_minute, n_bars=500)
-        if data is None or data.empty:
-            return "⚠️ No data fetched from TradingView."
-
+def fetch_mnq_data(symbol="MNQ1!", exchange="CME_MINI", interval=Interval.in_5_minute, n_bars=100):
+    data = tv.get_hist(symbol=symbol, exchange=exchange, interval=interval, n_bars=n_bars)
+    return data
         latest = data.iloc[-1]
         close = latest['close']
         vwap = data['close'].rolling(14).mean().iloc[-1]
