@@ -1,1 +1,1 @@
-# Placeholder for browser.py
+# browser utils

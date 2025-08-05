@@ -1,1 +1,1 @@
-# Placeholder for const.py
+# constants used across the module
