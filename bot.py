@@ -1,73 +1,53 @@
 import os
-import time
-import threading
-import requests
+import logging
 from telegram.ext import Updater, CommandHandler
-from tradovate_api import TradovateClient
-from trade_logic import generate_trade_signal, monitor_trade
+from utils import generate_signal, get_status, get_news_summary
 from dotenv import load_dotenv
 
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-USERNAME = os.getenv("TRADOVATE_USERNAME")
-PASSWORD = os.getenv("TRADOVATE_PASSWORD")
-DEMO = os.getenv("TRADOVATE_DEMO", "true").lower() == "true"
+# Enable logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-client = TradovateClient(USERNAME, PASSWORD, demo=DEMO)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 
-updater = Updater(TELEGRAM_TOKEN, use_context=True)
-dispatcher = updater.dispatcher
+def start(update, context):
+    update.message.reply_text("🚀 MNQU5 Bot Activated!\nUse /scan to find setups.\nUse /status to view strategy.\nUse /news to get market news.")
 
-active_trades = {}
-autoscan_enabled = {"status": False}
+def scan(update, context):
+    signal = generate_signal()
+    update.message.reply_text(signal)
 
-def scan(update=None, context=None, auto=False):
-    if not auto and update:
-        update.message.reply_text("📡 Scanning MNQU5 for setups...")
+def status(update, context):
+    status_msg = get_status()
+    update.message.reply_text(status_msg)
 
-    signal = generate_trade_signal(client)
-    if signal:
-        msg = signal['message']
-        if update:
-            update.message.reply_text(msg)
-        else:
-            updater.bot.send_message(chat_id=os.getenv("ADMIN_CHAT_ID"), text=msg)
+def news(update, context):
+    news_msg = get_news_summary()
+    update.message.reply_text(news_msg)
 
-        tid = signal['id']
-        active_trades[tid] = signal
-        threading.Thread(target=monitor_trade, args=(client, update, signal)).start()
-    else:
-        if not auto and update:
-            update.message.reply_text("⚠️ No valid setups found.")
+def main():
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-def pingdata(update, context):
-    try:
-        price = client.get_last_price("MNQU5")
-        update.message.reply_text(f"✅ Tradovate data active\nLast MNQU5 price: {price}")
-    except Exception as e:
-        update.message.reply_text(f"❌ Error fetching data: {e}")
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("scan", scan))
+    dp.add_handler(CommandHandler("status", status))
+    dp.add_handler(CommandHandler("news", news))
 
-def autoscan_loop():
-    while True:
-        if autoscan_enabled["status"]:
-            scan(auto=True)
-        time.sleep(300)  # every 5 minutes
+    # Use webhook instead of polling
+    PORT = int(os.environ.get("PORT", 5000))
+    WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}/{BOT_TOKEN}"
 
-def autoscan_on(update, context):
-    autoscan_enabled["status"] = True
-    update.message.reply_text("✅ Auto-scanning enabled. The bot will now scan every 5 minutes.")
+    updater.start_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=BOT_TOKEN,
+        webhook_url=WEBHOOK_URL,
+    )
+    updater.idle()
 
-def autoscan_off(update, context):
-    autoscan_enabled["status"] = False
-    update.message.reply_text("🛑 Auto-scanning disabled.")
-
-dispatcher.add_handler(CommandHandler("scan", scan))
-dispatcher.add_handler(CommandHandler("pingdata", pingdata))
-dispatcher.add_handler(CommandHandler("autoscan_on", autoscan_on))
-dispatcher.add_handler(CommandHandler("autoscan_off", autoscan_off))
-
-threading.Thread(target=autoscan_loop, daemon=True).start()
-
-updater.start_polling()
-updater.idle()
+if __name__ == '__main__':
+    main()

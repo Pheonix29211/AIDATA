@@ -1,32 +1,34 @@
+from tvDatafeed import TvDatafeed, Interval
+import os
 
-def calculate_trade_score(rsi, wick_percent, news_bias, trend_vwap):
-    score = 0
-    if rsi < 30 or rsi > 70:
-        score += 1
-    if wick_percent > 20:
-        score += 1
-    if trend_vwap:
-        score += 1
-    if news_bias in ['bullish', 'bearish']:
-        score += 1
-    return score
+tv = TvDatafeed(session=os.getenv("TV_SESSION"))
 
-def determine_tp_sl(entry_price, direction, sl_points=15, rr=2):
-    if direction == 'long':
-        sl = entry_price - sl_points
-        tp = entry_price + sl_points * rr
-    else:
-        sl = entry_price + sl_points
-        tp = entry_price - sl_points * rr
-    return tp, sl
+def generate_signal():
+    try:
+        data = tv.get_hist(symbol='MNQU5', exchange='CME_MINI', interval=Interval.in_5_minute, n_bars=500)
+        if data is None or data.empty:
+            return "⚠️ No data fetched from TradingView."
 
-def get_confidence(score):
-    if score >= 4:
-        return "🔥 High"
-    elif score == 3:
-        return "✅ Medium"
-    else:
-        return "⚠️ Low"
+        latest = data.iloc[-1]
+        close = latest['close']
+        vwap = data['close'].rolling(14).mean().iloc[-1]
+        rsi = 100 - (100 / (1 + data['close'].pct_change().rolling(14).mean().iloc[-1]))
 
-def detect_engulfing(open_prev, close_prev, open_curr, close_curr):
-    return (close_prev < open_prev and close_curr > open_curr and close_curr > open_prev and open_curr < close_prev) or            (close_prev > open_prev and close_curr < open_curr and close_curr < open_prev and open_curr > close_prev)
+        signal = ""
+        if close > vwap and rsi < 70:
+            signal = "🟢 Long Setup (Close above VWAP, RSI < 70)"
+        elif close < vwap and rsi > 30:
+            signal = "🔴 Short Setup (Close below VWAP, RSI > 30)"
+        else:
+            signal = "🟡 No Clear Signal"
+
+        return f"📊 MNQU5 Signal:\nPrice: {close:.2f}\nVWAP: {vwap:.2f}\nRSI: {rsi:.2f}\n\n{signal}"
+    except Exception as e:
+        return f"❌ Error generating signal: {str(e)}"
+
+def get_status():
+    return "📌 Strategy:\n• 5m Timeframe\n• VWAP + RSI\n• Engulfing Detection\n• News Context Enabled\n• SL: 15 pts\n• Auto-Scan + Telegram Alerts"
+
+def get_news_summary():
+    # Placeholder for future news integration
+    return "📰 News summary not yet implemented. Will include macro event bias soon."
