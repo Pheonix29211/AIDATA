@@ -1,53 +1,59 @@
 import os
-import logging
-from telegram.ext import Updater, CommandHandler
-from utils import generate_signal, get_status, get_news_summary
-from dotenv import load_dotenv
+from telegram import Update, Bot
+from telegram.ext import CommandHandler, Updater, CallbackContext, Dispatcher
+from utils import (
+    scan_market_and_send_alerts,
+    get_trade_logs,
+    get_bot_status,
+    get_trade_results,
+    check_tvdata_connection,
+)
+from flask import Flask, request
 
-load_dotenv()
+# Telegram & Webhook Config
+TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/{TOKEN}"
+PORT = int(os.environ.get("PORT", 8443))
 
-# Enable logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
+bot = Bot(token=TOKEN)
+app = Flask(__name__)
+dispatcher = Dispatcher(bot=bot, update_queue=None, workers=4, use_context=True)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+# Command Handlers
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text("📡 SpiralBot Online! Use /menu to see options.")
 
-def start(update, context):
-    update.message.reply_text("🚀 MNQU5 Bot Activated!\nUse /scan to find setups.\nUse /status to view strategy.\nUse /news to get market news.")
+def menu(update: Update, context: CallbackContext):
+    update.message.reply_text("""
+🌀 SpiralBot Menu:
+/scan — Manual market scan
+/logs — Last 30 trades
+/status — Current strategy
+/results — Win stats
+/news — Latest news
+/check_tv — Verify TradingView data
+""")
 
-def scan(update, context):
-    signal = generate_signal()
-    update.message.reply_text(signal)
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(CommandHandler("menu", menu))
+dispatcher.add_handler(CommandHandler("scan", scan_market_and_send_alerts))
+dispatcher.add_handler(CommandHandler("logs", get_trade_logs))
+dispatcher.add_handler(CommandHandler("status", get_bot_status))
+dispatcher.add_handler(CommandHandler("results", get_trade_results))
+dispatcher.add_handler(CommandHandler("check_tv", check_tvdata_connection))
 
-def status(update, context):
-    status_msg = get_status()
-    update.message.reply_text(status_msg)
+# Webhook Route
+@app.route(f'/{TOKEN}', methods=['POST'])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), bot)
+    dispatcher.process_update(update)
+    return "ok"
 
-def news(update, context):
-    news_msg = get_news_summary()
-    update.message.reply_text(news_msg)
-
-def main():
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
-
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("scan", scan))
-    dp.add_handler(CommandHandler("status", status))
-    dp.add_handler(CommandHandler("news", news))
-
-    # Use webhook instead of polling
-    PORT = int(os.environ.get("PORT", 5000))
-    WEBHOOK_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}/{BOT_TOKEN}"
-
-    updater.start_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=BOT_TOKEN,
-        webhook_url=WEBHOOK_URL,
-    )
-    updater.idle()
+@app.route('/')
+def index():
+    return "🌀 SpiralBot Running"
 
 if __name__ == '__main__':
-    main()
+    bot.set_webhook(WEBHOOK_URL)
+    print("Webhook set:", WEBHOOK_URL)
+    app.run(host="0.0.0.0", port=PORT)

@@ -4,5 +4,5 @@ pandas
 numpy
 matplotlib
 flask
-git+https://github.com/StreamAlpha/tvdatafeed.git
+
 
