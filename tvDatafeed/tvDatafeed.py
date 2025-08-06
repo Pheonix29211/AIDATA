@@ -1,43 +1,75 @@
-def get_hist(self, symbol, exchange, interval, n_bars):
-    tv_symbol = f"{exchange}:{symbol}"
-    resolution = interval
+import requests
+import pandas as pd
+import time
+from datetime import datetime
+import os
 
-    now = int(datetime.now().timestamp())
-    from_time = now - int(n_bars) * int(resolution) * 60
+class Interval:
+    in_1_minute = "1"
+    in_5_minute = "5"
+    in_15_minute = "15"
+    in_1_hour = "60"
+    in_1_day = "1D"
 
-    url = f"https://tvd.tradingview.com/history"
+class TvDatafeed:
+    def __init__(self, session=None):
+        self.session = requests.Session()
+        self.headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.tradingview.com/"
+        }
 
-    params = {
-        "symbol": tv_symbol,
-        "resolution": resolution,
-        "from": from_time,
-        "to": now,
-        "countback": n_bars,
-    }
+        # Get session ID from environment or argument
+        self.session_id = session or os.getenv("TV_SESSION")
+        if not self.session_id:
+            raise Exception("❌ TV_SESSION not set")
 
-    headers = {
-        "Referer": "https://www.tradingview.com/",
-        "X-Requested-With": "XMLHttpRequest"
-    }
+        self.session.cookies.set("sessionid", self.session_id)
+        print("✅ Session ID set for TradingView")
 
-    response = self.session.get(url, params=params, headers=headers)
+    def get_hist(self, symbol, exchange, interval, n_bars):
+        tv_symbol = f"{exchange}:{symbol}"
 
-    if response.status_code != 200:
-        raise Exception(f"❌ TradingView connection failed with status {response.status_code}")
+        url = "https://tvd.tradingview.com/history"
 
-    data = response.json()
+        now = int(time.time())
+        from_time = now - self._interval_to_seconds(interval) * n_bars
 
-    if data.get("s") != "ok":
-        raise Exception("❌ TradingView connection failed")
+        params = {
+            "symbol": tv_symbol,
+            "resolution": interval,
+            "from": from_time,
+            "to": now
+        }
 
-    df = pd.DataFrame({
-        "time": pd.to_datetime(data["t"], unit="s"),
-        "open": data["o"],
-        "high": data["h"],
-        "low": data["l"],
-        "close": data["c"],
-        "volume": data["v"]
-    })
+        response = self.session.get(url, headers=self.headers, params=params)
+        data = response.json()
 
-    df.set_index("time", inplace=True)
-    return df
+        if data.get("s") != "ok":
+            raise Exception("❌ TradingView connection failed")
+
+        df = pd.DataFrame({
+            "time": [datetime.fromtimestamp(t) for t in data["t"]],
+            "open": data["o"],
+            "high": data["h"],
+            "low": data["l"],
+            "close": data["c"],
+            "volume": data["v"],
+        })
+
+        df.set_index("time", inplace=True)
+        return df
+
+    def _interval_to_seconds(self, interval):
+        if interval == Interval.in_1_minute:
+            return 60
+        elif interval == Interval.in_5_minute:
+            return 300
+        elif interval == Interval.in_15_minute:
+            return 900
+        elif interval == Interval.in_1_hour:
+            return 3600
+        elif interval == Interval.in_1_day:
+            return 86400
+        else:
+            raise ValueError("Unsupported interval")
