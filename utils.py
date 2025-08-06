@@ -1,13 +1,14 @@
 import os
+import pandas as pd
 from tvDatafeed import TvDatafeed, Interval
 
-# Authenticate with TradingView using env variables
+# Login to TradingView using Render secrets
 tv = TvDatafeed(
     username=os.getenv("TV_USERNAME"),
     password=os.getenv("TV_PASSWORD")
 )
 
-def fetch_mnq_data(symbol="MNQ1!", exchange="CME_MINI", interval=Interval.in_5_minute, n_bars=100):
+def fetch_mnq_data(symbol="MNQU5", exchange="CME_MINI", interval=Interval.in_5_minute, n_bars=100):
     try:
         data = tv.get_hist(symbol=symbol, exchange=exchange, interval=interval, n_bars=n_bars)
         latest = data.iloc[-1]
@@ -28,25 +29,29 @@ def fetch_mnq_data(symbol="MNQ1!", exchange="CME_MINI", interval=Interval.in_5_m
         return f"❌ Error generating signal: {str(e)}"
 
 def scan_market_and_send_alerts(update, context):
-    alert = fetch_mnq_data()
-    context.bot.send_message(chat_id=update.effective_chat.id, text=alert)
+    result = fetch_mnq_data()
+    context.bot.send_message(chat_id=update.effective_chat.id, text=result)
 
 def get_bot_status(update, context):
-    status = "📌 Strategy:\n• 5m Timeframe\n• VWAP + RSI\n• Engulfing Detection\n• News Context Enabled\n• SL: 15 pts\n• Auto-Scan + Telegram Alerts"
+    status = (
+        "📌 Strategy:\n"
+        "• 5m Timeframe\n"
+        "• VWAP + RSI\n"
+        "• MNQU5 futures\n"
+        "• News support coming soon\n"
+        "• SL: 15 pts | TP: 3x\n"
+    )
     context.bot.send_message(chat_id=update.effective_chat.id, text=status)
 
 def get_trade_logs(update, context):
-    context.bot.send_message(chat_id=update.effective_chat.id, text="🧾 Recent trades will be shown here. (Logging in progress)")
+    context.bot.send_message(chat_id=update.effective_chat.id, text="📜 Trade logs not yet implemented.")
 
 def get_trade_results(update, context):
-    context.bot.send_message(chat_id=update.effective_chat.id, text="📈 Results summary under development.")
+    context.bot.send_message(chat_id=update.effective_chat.id, text="📈 Trade results tracking coming soon.")
 
 def check_tvdata_connection(update, context):
     try:
-        tv.get_hist("MNQ1!", exchange="CME_MINI", interval=Interval.in_5_minute, n_bars=1)
-        context.bot.send_message(chat_id=update.effective_chat.id, text="✅ TradingView connection: SUCCESS")
+        tv.get_hist(symbol="MNQU5", exchange="CME_MINI", interval=Interval.in_5_minute, n_bars=5)
+        context.bot.send_message(chat_id=update.effective_chat.id, text="✅ TradingView connection OK!")
     except Exception as e:
-        context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ TradingView error: {str(e)}")
-
-def get_news_summary():
-    return "📰 News summary not yet implemented. Will include macro event bias soon."
+        context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ TradingView connection failed: {str(e)}")
