@@ -1,18 +1,19 @@
 import os
-from telegram import Update, Bot
-from telegram.ext import CommandHandler, Updater, CallbackContext, Dispatcher
+import threading
+from flask import Flask, request
+from telegram import Bot, Update
+from telegram.ext import Dispatcher, CommandHandler, CallbackContext
 from utils import (
     scan_market_and_send_alerts,
     get_trade_logs,
     get_bot_status,
     get_trade_results,
     check_tvdata_connection,
-    start_auto_scan
+    auto_scan
 )
-from flask import Flask, request
 
-# Telegram Config
 TOKEN = os.getenv("BOT_TOKEN")
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
 WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/{TOKEN}"
 PORT = int(os.environ.get("PORT", 8443))
 
@@ -20,19 +21,18 @@ bot = Bot(token=TOKEN)
 app = Flask(__name__)
 dispatcher = Dispatcher(bot=bot, update_queue=None, workers=4, use_context=True)
 
-# --- Command Handlers ---
+# Commands
 def start(update: Update, context: CallbackContext):
-    update.message.reply_text("📡 SpiralBot Online! Use /menu to see options.")
+    update.message.reply_text("📡 SpiralBot US100 Online! Use /menu for commands.")
 
 def menu(update: Update, context: CallbackContext):
     update.message.reply_text("""
 🌀 SpiralBot Menu:
-/scan — Manual market scan
+/scan — Manual scan
 /logs — Last 30 trades
-/status — Current strategy
+/status — Current logic
 /results — Win stats
-/news — Latest news
-/check_tv — Verify TradingView data
+/check_tv — Verify data source
 """)
 
 dispatcher.add_handler(CommandHandler("start", start))
@@ -43,7 +43,6 @@ dispatcher.add_handler(CommandHandler("status", get_bot_status))
 dispatcher.add_handler(CommandHandler("results", get_trade_results))
 dispatcher.add_handler(CommandHandler("check_tv", check_tvdata_connection))
 
-# --- Webhook ---
 @app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
@@ -57,5 +56,6 @@ def index():
 if __name__ == '__main__':
     bot.set_webhook(WEBHOOK_URL)
     print("✅ Webhook set:", WEBHOOK_URL)
-    start_auto_scan(bot)  # Starts auto 1m scanner
+    # Start background auto scan
+    threading.Thread(target=auto_scan, args=(bot,), daemon=True).start()
     app.run(host="0.0.0.0", port=PORT)
