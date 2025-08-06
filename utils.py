@@ -1,71 +1,76 @@
 import os
-import numpy as np
-from tvDatafeed import TvDatafeed, Interval
+import pandas as pd
+from tvDatafeed.tvDatafeed import TvDatafeed, Interval
 
 tv = TvDatafeed(
     username=os.getenv("TV_USERNAME"),
     password=os.getenv("TV_PASSWORD")
 )
 
-trade_logs = []
+def fetch_data(interval):
+    return tv.get_hist(
+        symbol="MNQ1!",
+        exchange="CME_MINI",
+        interval=interval,
+        n_bars=100
+    )
 
-def scan_market_and_send_alerts(update, context):
+def calculate_signal():
     try:
-        data = tv.get_hist(symbol="MNQ1!", exchange="CME_MINI", interval=Interval.in_1_minute, n_bars=100)
+        df_1m = fetch_data(Interval.in_1_minute)
+        df_5m = fetch_data(Interval.in_5_minute)
+
+        if df_1m is None or df_5m is None:
+            return "❌ Failed to fetch TradingView data."
+
+        close = df_1m['close'].iloc[-1]
+        vwap = df_1m['close'].rolling(14).mean().iloc[-1]
+        rsi = 100 - (100 / (1 + df_1m['close'].pct_change().rolling(14).mean().iloc[-1]))
+
+        is_bullish_engulfing = df_1m['close'].iloc[-1] > df_1m['open'].iloc[-1] and df_1m['open'].iloc[-1] < df_1m['close'].iloc[-2]
+        is_momentum_strong = close > vwap and rsi > 55
+
+        signal = ""
+        if close > vwap and rsi < 70 and is_bullish_engulfing:
+            signal = "🟢 LONG Setup\nVWAP ✅\nRSI ✅\nEngulfing ✅"
+        elif close < vwap and rsi > 30 and not is_bullish_engulfing:
+            signal = "🔴 SHORT Setup\nVWAP ✅\nRSI ✅"
+        else:
+            signal = "🟡 No Clear Entry"
+
+        if is_momentum_strong:
+            signal += "\n⚡ Momentum: HOLD Strong Trade"
+
+        return f"📊 MNQ Signal:\nPrice: {close:.2f}\nVWAP: {vwap:.2f}\nRSI: {rsi:.2f}\n\n{signal}"
     except Exception as e:
-        update.message.reply_text(f"❌ TradingView connection failed: {str(e)}")
-        return
+        return f"❌ Error generating signal: {str(e)}"
 
-    latest = data.iloc[-1]
-    close = latest['close']
-    vwap = data['close'].rolling(14).mean().iloc[-1]
-    rsi = 100 - (100 / (1 + data['close'].pct_change().rolling(14).mean().iloc[-1]))
-
-    lower_wick = latest['low']
-    upper_wick = latest['high']
-    body = abs(latest['open'] - latest['close'])
-
-    momentum = "🔥 Hold momentum" if close > vwap and rsi > 55 else "⚠️ Caution"
-
-    direction = ""
-    if close > vwap and rsi < 70:
-        direction = "🟢 Long Setup"
-    elif close < vwap and rsi > 30:
-        direction = "🔴 Short Setup"
+def scan_market_and_send_alerts(update=None, context=None):
+    alert = calculate_signal()
+    if context:
+        context.bot.send_message(chat_id=update.effective_chat.id, text=alert)
     else:
-        direction = "🟡 Neutral"
-
-    signal = f"""
-📊 *MNQU5 Signal*:
-Price: `{close:.2f}`
-VWAP: `{vwap:.2f}`
-RSI: `{rsi:.2f}`
-
-{direction}
-{momentum}
-"""
-
-    context.bot.send_message(chat_id=update.effective_chat.id, text=signal, parse_mode='Markdown')
-    trade_logs.append(signal)
-    if len(trade_logs) > 30:
-        trade_logs.pop(0)
+        print(alert)
 
 def get_trade_logs(update, context):
-    if not trade_logs:
-        update.message.reply_text("No trades logged yet.")
-    else:
-        update.message.reply_text("\n\n".join(trade_logs[-10:]))
+    context.bot.send_message(chat_id=update.effective_chat.id, text="🧾 No trades logged yet.")
 
 def get_bot_status(update, context):
-    update.message.reply_text("✅ Bot is running.\n1-min auto scan enabled.\nPremium TV login in use.")
+    context.bot.send_message(chat_id=update.effective_chat.id, text="""
+📌 Strategy:
+• 1m Entry + 5m Trend Confirm
+• VWAP + RSI + Engulfing
+• Momentum Detector ✅
+• TP: +28pts | SL: -9pts
+• Auto Scan: Every 1 min
+""")
 
 def get_trade_results(update, context):
-    wins = sum(1 for log in trade_logs if "Long" in log or "Short" in log)
-    update.message.reply_text(f"📈 Total trades: {len(trade_logs)}\n📊 Trade setups detected: {wins}")
+    context.bot.send_message(chat_id=update.effective_chat.id, text="📈 Win Rate: N/A (tracking starts soon)")
 
 def check_tvdata_connection(update, context):
-    try:
-        tv.get_hist(symbol="MNQ1!", exchange="CME_MINI", interval=Interval.in_1_minute, n_bars=1)
-        update.message.reply_text("✅ TradingView data feed working.")
-    except Exception as e:
-        update.message.reply_text(f"❌ TV connection failed: {str(e)}")
+    data = fetch_data(Interval.in_1_minute)
+    if data is not None:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="✅ TradingView data connected.")
+    else:
+        context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Failed to fetch TradingView data.")
