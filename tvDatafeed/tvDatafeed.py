@@ -1,8 +1,7 @@
 import requests
 import pandas as pd
-from datetime import datetime
 import json
-import os
+from datetime import datetime
 
 class Interval:
     in_1_minute = "1"
@@ -13,9 +12,8 @@ class Interval:
 
 class TvDatafeed:
     def __init__(self, username=None, password=None):
-        # Use ENV if values are not passed
-        self.username = username or os.getenv("TV_USERNAME")
-        self.password = password or os.getenv("TV_PASSWORD")
+        self.username = username
+        self.password = password
         self.session = requests.Session()
         self.authenticated = self.login()
 
@@ -23,15 +21,13 @@ class TvDatafeed:
         login_url = "https://www.tradingview.com/accounts/signin/"
         headers = {
             "Referer": "https://www.tradingview.com",
-            "Content-Type": "application/json"
+            "Content-Type": "application/x-www-form-urlencoded"
         }
         payload = {
             "username": self.username,
             "password": self.password
         }
-
-        response = self.session.post(login_url, data=json.dumps(payload), headers=headers)
-
+        response = self.session.post(login_url, data=payload, headers=headers)
         if response.status_code == 200 and "auth_token" in response.text:
             print("✅ Login successful")
             return True
@@ -45,7 +41,7 @@ class TvDatafeed:
         if resp.status_code != 200:
             raise Exception("Symbol search failed")
 
-        # Dummy historical data as placeholder
+        # Simulated data for now (replace with TradingView data parsing later)
         time_index = pd.date_range(end=datetime.now(), periods=n_bars, freq="5min")
         dummy_data = pd.DataFrame({
             'open': [100] * n_bars,
