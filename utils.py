@@ -7,7 +7,7 @@ tv = TvDatafeed(
     password=os.getenv("TV_PASSWORD")
 )
 
-def fetch_mnq_data(symbol="MNQ1!", exchange="CME_MINI", interval=Interval.in_5_minute, n_bars=100):
+def fetch_mnq_data(symbol="MNQ1!", exchange="CME_MINI", interval=Interval.in_5_minutes, n_bars=100):
     try:
         data = tv.get_hist(symbol=symbol, exchange=exchange, interval=interval, n_bars=n_bars)
         if data is None or data.empty:
@@ -16,10 +16,10 @@ def fetch_mnq_data(symbol="MNQ1!", exchange="CME_MINI", interval=Interval.in_5_m
         latest = data.iloc[-1]
         close = latest['close']
 
-        # VWAP = rolling average of close (simplified placeholder)
+        # VWAP = simplified rolling average of close prices
         vwap = data['close'].rolling(14).mean().iloc[-1]
 
-        # RSI (simplified method)
+        # RSI Calculation
         delta = data['close'].diff()
         gain = delta.where(delta > 0, 0).rolling(14).mean()
         loss = -delta.where(delta < 0, 0).rolling(14).mean()
@@ -42,7 +42,7 @@ def fetch_mnq_data(symbol="MNQ1!", exchange="CME_MINI", interval=Interval.in_5_m
 def get_status():
     return (
         "📌 Strategy:\n"
-        "• 5m Timeframe\n"
+        "• 5m Timeframe (Interval.in_5_minutes)\n"
         "• VWAP + RSI\n"
         "• Engulfing Detection (coming soon)\n"
         "• News Context Enabled\n"
