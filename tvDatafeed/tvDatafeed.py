@@ -18,30 +18,33 @@ class TvDatafeed:
         self.authenticated = self.login()
 
     def login(self):
-        login_url = "https://www.tradingview.com/accounts/signin/"
+        url = "https://www.tradingview.com/accounts/signin/"
         headers = {
-            "Referer": "https://www.tradingview.com",
-            "Content-Type": "application/x-www-form-urlencoded"
+            "Referer": "https://www.tradingview.com/",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0"
         }
         payload = {
             "username": self.username,
             "password": self.password
         }
-        response = self.session.post(login_url, data=json.dumps(payload), headers=headers)
-        if response.status_code == 200 and "auth_token" in response.text:
+        response = self.session.post(url, json=payload, headers=headers)
+
+        try:
+            response_data = response.json()
+        except Exception:
+            print(f"❌ Login failed: Invalid response: {response.text}")
+            return False
+
+        if "user" in response_data:
             print("✅ Login successful")
             return True
         else:
-            print(f"❌ Login failed: {response.text}")
+            print(f"❌ Login failed: {response_data}")
             return False
 
     def get_hist(self, symbol, exchange, interval, n_bars):
-        url = f"https://symbol-search.tradingview.com/symbol_search/?text={symbol}&exchange={exchange}"
-        resp = self.session.get(url)
-        if resp.status_code != 200:
-            raise Exception("Symbol search failed")
-
-        # Simulate getting data - replace with real API parsing if needed
+        # This is still simulated data
         time_index = pd.date_range(end=datetime.now(), periods=n_bars, freq="5min")
         dummy_data = pd.DataFrame({
             'open': [100] * n_bars,
