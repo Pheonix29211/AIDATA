@@ -8,32 +8,28 @@ class Interval:
     in_15_minute = "15"
     in_1_hour = "60"
     in_1_day = "1D"
-
 class TvDatafeed:
-    def __init__(self, username=None, password=None):
-        self.username = username
-        self.password = password
+    def __init__(self, session=None):
         self.session = requests.Session()
-        self.authenticated = self.login()
+        self.authenticated = False
 
-    def login(self):
-        login_url = "https://www.tradingview.com/accounts/signin/"
-        headers = {
-            "Referer": "https://www.tradingview.com",
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
-        payload = {
-            "username": self.username,
-            "password": self.password
-        }
-        response = self.session.post(login_url, data=payload, headers=headers)
-        if response.status_code == 200 and "auth_token" in response.text:
-            print("✅ Login successful")
-            return True
+        session_id = session or os.getenv("TV_SESSION")
+        if session_id:
+            self.session.cookies.set("sessionid", session_id, domain=".tradingview.com")
+            print("✅ Session ID set for TradingView")
+            self.authenticated = True
         else:
-            print(f"❌ Login failed: {response.text}")
-            return False
+            print("❌ TradingView session ID missing")
 
+    def get_hist(self, symbol, exchange, interval, n_bars):
+        try:
+            url = f"https://scanner.tradingview.com/{exchange.lower()}/scan"
+            # Add correct body if you’re fetching real data
+            # Use TradingView WebSocket or scrape for live data if needed (advanced)
+            raise Exception("Symbol search skipped (using premium session)")
+        except Exception as e:
+            print(f"❌ TV connection failed: {str(e)}")
+            return None
     def get_hist(self, symbol, exchange, interval, n_bars):
         try:
             url = f"https://scanner.tradingview.com/{exchange.lower()}/scan"

@@ -3,13 +3,12 @@ import threading
 import time
 import pandas as pd
 from datetime import datetime
-from tvDatafeed import TvDatafeed, Interval
+from tvDatafeed.tvDatafeed import TvDatafeed, Interval
+import os
 
-# --- TradingView Login ---
-tv = TvDatafeed(
-    username=os.getenv("TV_USERNAME"),
-    password=os.getenv("TV_PASSWORD")
-)
+tv = TvDatafeed(session=os.getenv("TV_SESSION"))
+
+
 
 # --- Memory Trade Log ---
 trade_logs = []
