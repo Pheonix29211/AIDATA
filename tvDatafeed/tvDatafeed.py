@@ -26,7 +26,6 @@ class TvDatafeed:
             "username": self.username,
             "password": self.password
         }
-        # ✅ Send as form data, NOT JSON
         response = self.session.post(login_url, data=payload, headers=headers)
         if response.status_code == 200 and "auth_token" in response.text:
             print("✅ Login successful")
@@ -37,18 +36,35 @@ class TvDatafeed:
 
     def get_hist(self, symbol, exchange, interval, n_bars):
         try:
-            # NOTE: This is placeholder logic, as TV blocks full scraping
-            # You can replace this with your own browser scraping or websocket method
-            print(f"Fetching data: {symbol} | {exchange} | Interval: {interval} | Bars: {n_bars}")
-            time_index = pd.date_range(end=datetime.now(), periods=n_bars, freq="1min")
-            dummy_data = pd.DataFrame({
-                'open': [100] * n_bars,
-                'high': [105] * n_bars,
-                'low': [95] * n_bars,
-                'close': [102] * n_bars,
-                'volume': [1000] * n_bars
-            }, index=time_index)
-            return dummy_data
+            url = f"https://scanner.tradingview.com/{exchange.lower()}/scan"
+            headers = {
+                "Referer": "https://www.tradingview.com",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "symbols": {"tickers": [f"{exchange}:{symbol}"], "query": {"types": []}},
+                "columns": [
+                    f"open|{interval}",
+                    f"high|{interval}",
+                    f"low|{interval}",
+                    f"close|{interval}",
+                    f"volume|{interval}"
+                ]
+            }
+
+            response = self.session.post(url, json=payload, headers=headers)
+            if response.status_code != 200:
+                raise Exception("❌ TradingView connection failed")
+
+            data = response.json()
+            if "data" not in data or not data["data"]:
+                raise Exception("❌ No chart data returned")
+
+            chart_data = data["data"][0]["d"]
+            df = pd.DataFrame(chart_data).transpose()
+            df.columns = ["open", "high", "low", "close", "volume"]
+            df.index = pd.date_range(end=datetime.now(), periods=len(df), freq=f"{interval}min")
+            return df
+
         except Exception as e:
-            print(f"❌ TV connection failed: {e}")
-            return None
+            raise Exception(f"❌ TV connection failed: {str(e)}")
