@@ -1,6 +1,8 @@
 import requests
 import pandas as pd
 from datetime import datetime
+import json
+import os
 
 class Interval:
     in_1_minute = "1"
@@ -11,8 +13,9 @@ class Interval:
 
 class TvDatafeed:
     def __init__(self, username=None, password=None):
-        self.username = username
-        self.password = password
+        # Use ENV if values are not passed
+        self.username = username or os.getenv("TV_USERNAME")
+        self.password = password or os.getenv("TV_PASSWORD")
         self.session = requests.Session()
         self.authenticated = self.login()
 
@@ -26,8 +29,10 @@ class TvDatafeed:
             "username": self.username,
             "password": self.password
         }
-        response = self.session.post(login_url, json=payload, headers=headers)
-        if response.status_code == 200:
+
+        response = self.session.post(login_url, data=json.dumps(payload), headers=headers)
+
+        if response.status_code == 200 and "auth_token" in response.text:
             print("✅ Login successful")
             return True
         else:
@@ -35,13 +40,18 @@ class TvDatafeed:
             return False
 
     def get_hist(self, symbol, exchange, interval, n_bars):
-        # Skip symbol search and return dummy or placeholder data if needed
-        time_index = pd.date_range(end=datetime.now(), periods=n_bars, freq="1min")
+        url = f"https://symbol-search.tradingview.com/symbol_search/?text={symbol}&exchange={exchange}"
+        resp = self.session.get(url)
+        if resp.status_code != 200:
+            raise Exception("Symbol search failed")
+
+        # Dummy historical data as placeholder
+        time_index = pd.date_range(end=datetime.now(), periods=n_bars, freq="5min")
         dummy_data = pd.DataFrame({
             'open': [100] * n_bars,
             'high': [105] * n_bars,
             'low': [95] * n_bars,
-            'close': [102 + i*0.1 for i in range(n_bars)],
+            'close': [102] * n_bars,
             'volume': [1000] * n_bars
         }, index=time_index)
         return dummy_data
