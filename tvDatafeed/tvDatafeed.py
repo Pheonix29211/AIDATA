@@ -28,7 +28,7 @@ class TvDatafeed:
             "username": self.username,
             "password": self.password
         }
-        response = self.session.post(url, json=payload, headers=headers)
+       response = self.session.post(login_url, data=payload, headers=headers)
 
         try:
             response_data = response.json()

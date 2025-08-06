@@ -1,12 +1,12 @@
+from tvDatafeed.tvDatafeed import TvDatafeed, Interval
 import os
-import pandas as pd
-from tvDatafeed import TvDatafeed, Interval
 
-# Login to TradingView using Render secrets
-tv = TvDatafeed(
-    username=os.getenv("TV_USERNAME"),
-    password=os.getenv("TV_PASSWORD")
-)
+# 🔐 Fetch username and password from environment
+username = os.getenv("TV_USERNAME")
+password = os.getenv("TV_PASSWORD")
+
+# ✅ Initialize tv with credentials from Render secrets
+tv = TvDatafeed(username=username, password=password)
 
 def fetch_mnq_data(symbol="MNQU5", exchange="CME_MINI", interval=Interval.in_5_minute, n_bars=100):
     try:
