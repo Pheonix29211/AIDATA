@@ -73,8 +73,7 @@ def auto_scan():
             time.sleep(60)  # Wait a bit after signal before monitoring
             monitor_open_trade(bot, OWNER_CHAT_ID)
         time.sleep(300)  # Scan every 5 mins
-
-if name == "__main__":
+if __name__ == "__main__":
     from threading import Thread
     Thread(target=auto_scan).start()
     app.run(host="0.0.0.0", port=10000)
