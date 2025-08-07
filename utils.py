@@ -1,105 +1,140 @@
-import os
-import json
-import time
 import requests
+import time
 from datetime import datetime
 
-TRADE_LOG_FILE = "trades.json"
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
-SL_USD = 300
-TP_USD = 600
-MAX_TP_USD = 1500
+TRADE_LOG = []
+ACTIVE_TRADE = None
+LAST_DIRECTION = None
 
-def fetch_price_from_bybit():
+BYBIT_ENDPOINT = "https://api.bybit.com/v5/market/kline"
+MEXC_ENDPOINT = "https://www.mexc.com/open/api/v2/market/kline"
+SYMBOL = "BTCUSDT"
+INTERVAL = "5"
+SL_DOLLARS = 300
+TP_MIN = 600
+TP_MAX = 1500
+
+def fetch_bybit_data():
     try:
-        url = f"https://api.bybit.com/v2/public/tickers?symbol={SYMBOL}"
-        res = requests.get(url)
-        price = float(res.json()['result'][0]['last_price'])
-        return price
-    except Exception:
+        now = int(time.time())
+        resp = requests.get(BYBIT_ENDPOINT, params={
+            "symbol": SYMBOL,
+            "interval": INTERVAL,
+            "from": now - 1500,
+            "limit": 100
+        })
+        data = resp.json()
+        if 'result' in data and 'list' in data['result']:
+            return data['result']['list']
+    except:
         return None
 
-def fetch_price_from_mexc():
+def fetch_mexc_data():
     try:
-        url = f"https://api.mexc.com/api/v3/ticker/price?symbol={SYMBOL}"
-        res = requests.get(url)
-        price = float(res.json()['price'])
-        return price
-    except Exception:
+        resp = requests.get(MEXC_ENDPOINT, params={
+            "symbol": SYMBOL,
+            "interval": INTERVAL,
+            "limit": 100
+        })
+        data = resp.json()
+        if 'data' in data:
+            return data['data']
+    except:
         return None
 
-def fetch_price():
-    price = fetch_price_from_bybit()
-    return price if price else fetch_price_from_mexc()
+def analyze_data(candles):
+    if not candles:
+        return None
 
-def generate_trade_signal():
-    price = fetch_price()
-    if not price:
-        return None, "❌ Error: Failed to fetch price"
-    
-    # Placeholder logic: You should replace this with actual indicator-based logic
-    if int(time.time()) % 2 == 0:
-        return {
-            "direction": "LONG",
-            "entry": price,
-            "confidence": 8.4,
-            "rsi": 28.6,
-            "timestamp": datetime.utcnow().isoformat()
-        }, None
-    else:
-        return {
-            "direction": "SHORT",
-            "entry": price,
-            "confidence": 8.2,
-            "rsi": 71.1,
-            "timestamp": datetime.utcnow().isoformat()
-        }, None
+    close_prices = [float(c[4]) for c in candles]
+    ema5 = sum(close_prices[-5:]) / 5
+    ema20 = sum(close_prices[-20:]) / 20
+    current_price = close_prices[-1]
 
-def save_trade(trade):
-    trades = load_trades()
-    trades.append(trade)
-    with open(TRADE_LOG_FILE, "w") as f:
-        json.dump(trades, f, indent=2)
+    rsi = calculate_rsi(close_prices)
+    direction = None
+    score = 0
 
-def load_trades():
-    if not os.path.exists(TRADE_LOG_FILE):
-        return []
-    with open(TRADE_LOG_FILE, "r") as f:
-        return json.load(f)
+    if rsi < 30 and ema5 > ema20:
+        direction = "LONG"
+        score += 1
+    if rsi > 70 and ema5 < ema20:
+        direction = "SHORT"
+        score += 1
 
-def get_trade_logs(n=30):
-    trades = load_trades()
-    last_trades = trades[-n:]
-    logs = ""
-    for t in last_trades:
-        logs += f"{t['timestamp']} | {t['direction']} @ ${t['entry']} | RSI: {t['rsi']} | Confidence: {t['confidence']} | Result: {t.get('result', 'N/A')}\n"
-    return logs or "No trades logged yet."
+    return {
+        "price": current_price,
+        "rsi": rsi,
+        "ema5": ema5,
+        "ema20": ema20,
+        "score": score,
+        "direction": direction
+    }
+
+def calculate_rsi(prices, period=14):
+    deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+    gains = [delta for delta in deltas if delta > 0]
+    losses = [-delta for delta in deltas if delta < 0]
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period if losses else 0.0001
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+def scan_market(test_mode=False):
+    global ACTIVE_TRADE, LAST_DIRECTION
+
+    data = fetch_bybit_data()
+    if not data:
+        data = fetch_mexc_data()
+    if not data:
+        return "❌ Error: Failed to fetch data"
+
+    analysis = analyze_data(data)
+    if not analysis or not analysis["direction"]:
+        return "No strong setup found."
+
+    if ACTIVE_TRADE:
+        return f"⚠️ Trade already active: {ACTIVE_TRADE['direction']} @ {ACTIVE_TRADE['entry']}"
+
+    signal = f"""
+🚨 *{analysis['direction']} Signal*
+Entry: {analysis['price']}
+RSI: {analysis['rsi']:.2f}
+Score: {analysis['score']}
+TP: +${TP_MIN} → ${TP_MAX}
+SL: -${SL_DOLLARS}
+"""
+    ACTIVE_TRADE = {
+        "direction": analysis["direction"],
+        "entry": analysis["price"],
+        "timestamp": datetime.now()
+    }
+    LAST_DIRECTION = analysis["direction"]
+    TRADE_LOG.append({
+        "time": str(datetime.now()),
+        "entry": analysis["price"],
+        "dir": analysis["direction"],
+        "rsi": analysis["rsi"],
+        "ema5": analysis["ema5"],
+        "ema20": analysis["ema20"],
+        "score": analysis["score"]
+    })
+
+    return signal.strip()
+
+def get_trade_logs():
+    if not TRADE_LOG:
+        return "No trades yet."
+    return "\n".join([
+        f"{i+1}. {t['time']} | {t['dir']} @ {t['entry']} | RSI: {t['rsi']:.2f} | Score: {t['score']}"
+        for i, t in enumerate(TRADE_LOG[-30:])
+    ])
 
 def get_results():
-    trades = load_trades()
-    if not trades:
-        return "No trades recorded."
+    wins = sum(1 for t in TRADE_LOG if t['score'] >= 1)
+    total = len(TRADE_LOG)
+    winrate = (wins / total * 100) if total else 0
+    return f"📊 Total: {total} | Wins: {wins} | Winrate: {winrate:.1f}%"
 
-    wins = [t for t in trades if t.get("result") == "WIN"]
-    losses = [t for t in trades if t.get("result") == "LOSS"]
-    total = len(trades)
-    win_rate = (len(wins) / total) * 100 if total else 0
-    avg_conf = sum([t['confidence'] for t in trades]) / total if total else 0
-
-    return (
-        f"📈 Results:\n"
-        f"Total Trades: {total}\n"
-        f"✅ Wins: {len(wins)}\n"
-        f"❌ Losses: {len(losses)}\n"
-        f"🏆 Win Rate: {win_rate:.2f}%\n"
-        f"📊 Avg. Confidence: {avg_conf:.2f}"
-    )
-
-def check_data_source():
-    bybit = fetch_price_from_bybit()
-    if bybit:
-        return f"✅ Bybit working: ${bybit:.2f}"
-    mexc = fetch_price_from_mexc()
-    if mexc:
-        return f"⚠️ Bybit failed, using MEXC: ${mexc:.2f}"
-    return "❌ Both Bybit and MEXC failed to fetch data"
+def get_status():
+    return f"✅ Logic:\n• Symbol: {SYMBOL}\n• Timeframe: {INTERVAL}m\n• SL: ${SL_DOLLARS}\n• TP: ${TP_MIN} to ${TP_MAX}\n• Momentum: 1m + 5m VWAP & EMA\n• Ping: 1m intervals\n• Active: {'Yes' if ACTIVE_TRADE else 'No'}"
