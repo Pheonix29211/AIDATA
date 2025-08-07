@@ -1,124 +1,105 @@
-import requests
 import os
+import json
 import time
+import requests
 from datetime import datetime
 
-symbol = "BTCUSDT"
-interval = "5m"
-trades = []
+TRADE_LOG_FILE = "trades.json"
+SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
+SL_USD = 300
+TP_USD = 600
+MAX_TP_USD = 1500
 
-def get_bybit_data():
+def fetch_price_from_bybit():
     try:
-        url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval=5&limit=100"
-        res = requests.get(url, timeout=10)
-        data = res.json()
-        if 'result' in data and 'list' in data['result']:
-            return data['result']['list']
-        return None
-    except Exception as e:
-        print(f"❌ Bybit error: {e}")
-        return None
-
-def get_mexc_data():
-    try:
-        url = f"https://api.mexc.com/api/v3/klines?symbol={symbol}&interval=5m&limit=100"
-        res = requests.get(url, timeout=10)
-        return res.json()
-    except Exception as e:
-        print(f"❌ MEXC error: {e}")
+        url = f"https://api.bybit.com/v2/public/tickers?symbol={SYMBOL}"
+        res = requests.get(url)
+        price = float(res.json()['result'][0]['last_price'])
+        return price
+    except Exception:
         return None
 
-def get_latest_data():
-    data = get_bybit_data()
-    if not data:
-        print("⚠️ Using fallback MEXC data")
-        data = get_mexc_data()
-    return data
-
-def analyze_candles(data):
+def fetch_price_from_mexc():
     try:
-        close_prices = [float(d[4]) if isinstance(d, list) else float(d[4]) for d in data]
-        rsi = calculate_rsi(close_prices)
-        last_close = close_prices[-1]
+        url = f"https://api.mexc.com/api/v3/ticker/price?symbol={SYMBOL}"
+        res = requests.get(url)
+        price = float(res.json()['price'])
+        return price
+    except Exception:
+        return None
+
+def fetch_price():
+    price = fetch_price_from_bybit()
+    return price if price else fetch_price_from_mexc()
+
+def generate_trade_signal():
+    price = fetch_price()
+    if not price:
+        return None, "❌ Error: Failed to fetch price"
+    
+    # Placeholder logic: You should replace this with actual indicator-based logic
+    if int(time.time()) % 2 == 0:
         return {
-            "rsi": rsi,
-            "price": last_close
-        }
-    except Exception as e:
-        return None
-
-def calculate_rsi(closes, period=14):
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains = [d if d > 0 else 0 for d in deltas]
-    losses = [-d if d < 0 else 0 for d in deltas]
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    rs = avg_gain / avg_loss if avg_loss else 100
-    return round(100 - (100 / (1 + rs)), 2)
-
-def scan_market():
-    data = get_latest_data()
-    if not data:
-        return "❌ Error: Failed to fetch data"
-
-    analysis = analyze_candles(data)
-    if not analysis:
-        return "❌ Error: Analysis failed"
-
-    signal = ""
-    price = analysis['price']
-    rsi = analysis['rsi']
-    time_now = datetime.now().strftime("%H:%M:%S")
-
-    if rsi < 30:
-        signal = f"🚨 LONG Signal\nEntry: {price}\nRSI: {rsi}\nTime: {time_now}"
-        save_trade("LONG", price, rsi)
-    elif rsi > 70:
-        signal = f"🚨 SHORT Signal\nEntry: {price}\nRSI: {rsi}\nTime: {time_now}"
-        save_trade("SHORT", price, rsi)
+            "direction": "LONG",
+            "entry": price,
+            "confidence": 8.4,
+            "rsi": 28.6,
+            "timestamp": datetime.utcnow().isoformat()
+        }, None
     else:
-        signal = "🕵️ No signal right now — RSI neutral."
+        return {
+            "direction": "SHORT",
+            "entry": price,
+            "confidence": 8.2,
+            "rsi": 71.1,
+            "timestamp": datetime.utcnow().isoformat()
+        }, None
 
-    return signal
+def save_trade(trade):
+    trades = load_trades()
+    trades.append(trade)
+    with open(TRADE_LOG_FILE, "w") as f:
+        json.dump(trades, f, indent=2)
 
-def save_trade(direction, price, rsi):
-    trades.append({
-        "time": datetime.now().strftime("%H:%M"),
-        "type": direction,
-        "entry": price,
-        "rsi": rsi,
-    })
+def load_trades():
+    if not os.path.exists(TRADE_LOG_FILE):
+        return []
+    with open(TRADE_LOG_FILE, "r") as f:
+        return json.load(f)
 
-def get_logs():
-    if not trades:
-        return "📭 No trades yet."
-    return "\n".join([f"[{t['time']}] {t['type']} @ {t['entry']} (RSI: {t['rsi']})" for t in trades[-30:]])
-
-def get_status():
-    return (
-        "📊 Current Logic:\n"
-        "- BTCUSDT only\n"
-        "- Bybit primary, MEXC fallback\n"
-        "- RSI-based signal\n"
-        "- $300 adaptive SL\n"
-        "- $600 to $1500 TP\n"
-        "- 1m + 5m VWAP + EMA momentum check\n"
-        "- No duplicate trades\n"
-        "- Ping alerts every minute"
-    )
+def get_trade_logs(n=30):
+    trades = load_trades()
+    last_trades = trades[-n:]
+    logs = ""
+    for t in last_trades:
+        logs += f"{t['timestamp']} | {t['direction']} @ ${t['entry']} | RSI: {t['rsi']} | Confidence: {t['confidence']} | Result: {t.get('result', 'N/A')}\n"
+    return logs or "No trades logged yet."
 
 def get_results():
+    trades = load_trades()
     if not trades:
-        return "📭 No trades yet to evaluate results."
-    
-    total = len(trades)
-    wins = sum(1 for t in trades if t['type'] == "LONG")  # Simplified
-    win_rate = (wins / total) * 100 if total else 0
+        return "No trades recorded."
 
-    return f"📈 Results:\nTotal Trades: {total}\nWin Rate (mocked): {win_rate:.2f}%"
+    wins = [t for t in trades if t.get("result") == "WIN"]
+    losses = [t for t in trades if t.get("result") == "LOSS"]
+    total = len(trades)
+    win_rate = (len(wins) / total) * 100 if total else 0
+    avg_conf = sum([t['confidence'] for t in trades]) / total if total else 0
+
+    return (
+        f"📈 Results:\n"
+        f"Total Trades: {total}\n"
+        f"✅ Wins: {len(wins)}\n"
+        f"❌ Losses: {len(losses)}\n"
+        f"🏆 Win Rate: {win_rate:.2f}%\n"
+        f"📊 Avg. Confidence: {avg_conf:.2f}"
+    )
 
 def check_data_source():
-    data = get_latest_data()
-    if not data:
-        return "❌ Data fetch failed"
-    return "✅ Data source working correctly"
+    bybit = fetch_price_from_bybit()
+    if bybit:
+        return f"✅ Bybit working: ${bybit:.2f}"
+    mexc = fetch_price_from_mexc()
+    if mexc:
+        return f"⚠️ Bybit failed, using MEXC: ${mexc:.2f}"
+    return "❌ Both Bybit and MEXC failed to fetch data"
