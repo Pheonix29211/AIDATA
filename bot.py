@@ -1,79 +1,70 @@
 import os
-import time
-from flask import Flask, request
-from telegram import Bot
-from telegram.ext import Dispatcher, CommandHandler
+import logging
+from telegram.ext import Updater, CommandHandler
 from utils import (
     scan_market,
-    get_recent_trades,
-    get_results,
-    get_status,
-    monitor_open_trade
+    get_trade_logs,
+    get_results_summary,
+    get_bot_status,
+    check_data_connection,
 )
+from dotenv import load_dotenv
 
-TOKEN = os.getenv("BOT_TOKEN")
-OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
-app = Flask(__name__)
-bot = Bot(token=TOKEN)
-dispatcher = Dispatcher(bot, None, workers=0)
+load_dotenv()
 
-# === Commands ===
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 def start(update, context):
-    context.bot.send_message(chat_id=update.effective_chat.id, text="🌀 SpiralBot active.")
+    update.message.reply_text("🌀 SpiralBot activated.\nType /menu to see options.")
+
+def menu(update, context):
+    update.message.reply_text(
+        "🌀 SpiralBot Menu:\n"
+        "/scan — Manual signal scan\n"
+        "/logs — Last 30 trades\n"
+        "/status — Current strategy\n"
+        "/results — Win/Loss stats\n"
+        "/check_data — Check Bybit/MEXC\n"
+    )
 
 def scan(update, context):
     signal = scan_market()
-    context.bot.send_message(chat_id=update.effective_chat.id, text=signal)
+    update.message.reply_text(signal)
 
 def logs(update, context):
-    trades = get_recent_trades()
-    context.bot.send_message(chat_id=update.effective_chat.id, text=trades)
-
-def results(update, context):
-    res = get_results()
-    context.bot.send_message(chat_id=update.effective_chat.id, text=res)
+    log_data = get_trade_logs()
+    update.message.reply_text(log_data)
 
 def status(update, context):
-    logic = get_status()
-    context.bot.send_message(chat_id=update.effective_chat.id, text=logic)
+    status = get_bot_status()
+    update.message.reply_text(status)
 
-def menu(update, context):
-    menu_text = (
-        "🌀 SpiralBot Menu:\n"
-        "/scan — Manual scan\n"
-        "/logs — Last 30 trades\n"
-        "/status — Current logic\n"
-        "/results — Win stats\n"
-    )
-    context.bot.send_message(chat_id=update.effective_chat.id, text=menu_text)
+def results(update, context):
+    summary = get_results_summary()
+    update.message.reply_text(summary)
 
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CommandHandler("scan", scan))
-dispatcher.add_handler(CommandHandler("logs", logs))
-dispatcher.add_handler(CommandHandler("results", results))
-dispatcher.add_handler(CommandHandler("status", status))
-dispatcher.add_handler(CommandHandler("menu", menu))
+def check_data(update, context):
+    result = check_data_connection()
+    update.message.reply_text(result)
 
-@app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    update = request.get_json(force=True)
-    dispatcher.process_update(update)
-    return "OK"
+def main():
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-@app.route("/")
-def index():
-    return "Bot is live."
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("menu", menu))
+    dp.add_handler(CommandHandler("scan", scan))
+    dp.add_handler(CommandHandler("logs", logs))
+    dp.add_handler(CommandHandler("status", status))
+    dp.add_handler(CommandHandler("results", results))
+    dp.add_handler(CommandHandler("check_data", check_data))
 
-# === Auto Scanner ===
-def auto_scan():
-    while True:
-        signal = scan_market()
-        if signal:
-            bot.send_message(chat_id=OWNER_CHAT_ID, text=signal)
-            time.sleep(60)  # Wait a bit after signal before monitoring
-            monitor_open_trade(bot, OWNER_CHAT_ID)
-        time.sleep(300)  # Scan every 5 mins
+    updater.start_polling()
+    updater.idle()
+
 if __name__ == "__main__":
-    from threading import Thread
-    Thread(target=auto_scan).start()
-    app.run(host="0.0.0.0", port=10000)
+    main()
