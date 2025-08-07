@@ -1,58 +1,80 @@
 import os
+import time
 from flask import Flask, request
-from telegram import Bot, Update
-from telegram.ext import Dispatcher, CommandHandler, CallbackContext
+from telegram import Bot
+from telegram.ext import Dispatcher, CommandHandler
 from utils import (
-    scan_market_and_send_alerts,
-    get_trade_logs,
-    get_bot_status,
-    get_trade_results,
-    check_data_connection,
-    auto_scan_start,
+    scan_market,
+    get_recent_trades,
+    get_results,
+    get_status,
+    monitor_open_trade
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/{TOKEN}"
-PORT = int(os.environ.get("PORT", 8443))
-
-bot = Bot(token=TOKEN)
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
 app = Flask(__name__)
-dispatcher = Dispatcher(bot=bot, update_queue=None, use_context=True)
+bot = Bot(token=TOKEN)
+dispatcher = Dispatcher(bot, None, workers=0)
 
-# Commands
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text("📡 SpiralBot Online! Use /menu to see options.")
+# === Commands ===
+def start(update, context):
+    context.bot.send_message(chat_id=update.effective_chat.id, text="🌀 SpiralBot active.")
 
-def menu(update: Update, context: CallbackContext):
-    update.message.reply_text("""
-🌀 SpiralBot Menu:
-/scan — Manual scan
-/logs — Last 30 trades
-/status — Current logic
-/results — Win stats
-/check_data — Verify data source
-""")
+def scan(update, context):
+    signal = scan_market()
+    context.bot.send_message(chat_id=update.effective_chat.id, text=signal)
+
+def logs(update, context):
+    trades = get_recent_trades()
+    context.bot.send_message(chat_id=update.effective_chat.id, text=trades)
+
+def results(update, context):
+    res = get_results()
+    context.bot.send_message(chat_id=update.effective_chat.id, text=res)
+
+def status(update, context):
+    logic = get_status()
+    context.bot.send_message(chat_id=update.effective_chat.id, text=logic)
+
+def menu(update, context):
+    menu_text = (
+        "🌀 SpiralBot Menu:\n"
+        "/scan — Manual scan\n"
+        "/logs — Last 30 trades\n"
+        "/status — Current logic\n"
+        "/results — Win stats\n"
+    )
+    context.bot.send_message(chat_id=update.effective_chat.id, text=menu_text)
 
 dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(CommandHandler("scan", scan))
+dispatcher.add_handler(CommandHandler("logs", logs))
+dispatcher.add_handler(CommandHandler("results", results))
+dispatcher.add_handler(CommandHandler("status", status))
 dispatcher.add_handler(CommandHandler("menu", menu))
-dispatcher.add_handler(CommandHandler("scan", scan_market_and_send_alerts))
-dispatcher.add_handler(CommandHandler("logs", get_trade_logs))
-dispatcher.add_handler(CommandHandler("status", get_bot_status))
-dispatcher.add_handler(CommandHandler("results", get_trade_results))
-dispatcher.add_handler(CommandHandler("check_data", check_data_connection))
 
-@app.route(f'/{TOKEN}', methods=['POST'])
+@app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
+    update = request.get_json(force=True)
     dispatcher.process_update(update)
-    return "ok"
+    return "OK"
 
-@app.route('/')
+@app.route("/")
 def index():
-    return "🌀 SpiralBot Running"
+    return "Bot is live."
 
-if __name__ == '__main__':
-    bot.set_webhook(WEBHOOK_URL)
-    print("✅ Webhook set:", WEBHOOK_URL)
-    auto_scan_start(bot)
-    app.run(host='0.0.0.0', port=PORT)
+# === Auto Scanner ===
+def auto_scan():
+    while True:
+        signal = scan_market()
+        if signal:
+            bot.send_message(chat_id=OWNER_CHAT_ID, text=signal)
+            time.sleep(60)  # Wait a bit after signal before monitoring
+            monitor_open_trade(bot, OWNER_CHAT_ID)
+        time.sleep(300)  # Scan every 5 mins
+
+if name == "__main__":
+    from threading import Thread
+    Thread(target=auto_scan).start()
+    app.run(host="0.0.0.0", port=10000)

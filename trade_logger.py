@@ -1,1 +1,0 @@
-# Logs each trade: result, RRR, SL, TP, confidence, timestamp

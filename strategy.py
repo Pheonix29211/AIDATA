@@ -1,1 +1,0 @@
-# Core strategy logic: VWAP + Fib + RSI + Engulfing + Momentum Hold
