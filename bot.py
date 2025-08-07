@@ -95,7 +95,19 @@ def main():
     dp.add_handler(CommandHandler("status", status))
     dp.add_handler(CommandHandler("check_data", check_data))
 
-    updater.start_polling()
+   PORT = int(os.environ.get("PORT", 8443))
+HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+
+if not HOSTNAME:
+    print("❌ HOSTNAME missing. Set RENDER_EXTERNAL_HOSTNAME in env vars.")
+    return
+
+updater.start_webhook(
+    listen="0.0.0.0",
+    port=PORT,
+    url_path=TOKEN,
+    webhook_url=f"https://{HOSTNAME}/{TOKEN}",
+)
     updater.idle()
 
 if __name__ == "__main__":
