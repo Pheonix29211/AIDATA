@@ -1,56 +1,67 @@
 import os
-import logging
-from telegram.ext import Updater, CommandHandler
+import time
+from telegram import Bot, Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
 from utils import (
     scan_market,
     get_trade_logs,
-    get_results_summary,
     get_bot_status,
-    check_data_connection,
+    get_results,
+    check_data_source,
 )
-from dotenv import load_dotenv
 
-load_dotenv()
+# Load TOKEN from environment
+TOKEN = os.getenv("TOKEN")
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
+if not TOKEN:
+    raise ValueError("❌ Telegram bot TOKEN not found in environment variables.")
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+bot = Bot(token=TOKEN)
 
-def start(update, context):
-    update.message.reply_text("🌀 SpiralBot activated.\nType /menu to see options.")
 
-def menu(update, context):
+# === Command Handlers ===
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text("🌀 SpiralBot started.\nUse /menu to see all commands.")
+
+
+def menu(update: Update, context: CallbackContext):
     update.message.reply_text(
         "🌀 SpiralBot Menu:\n"
-        "/scan — Manual signal scan\n"
+        "/scan — Manual scan\n"
         "/logs — Last 30 trades\n"
-        "/status — Current strategy\n"
-        "/results — Win/Loss stats\n"
-        "/check_data — Check Bybit/MEXC\n"
+        "/status — Current logic\n"
+        "/results — Win stats\n"
+        "/check_data — Verify data source\n"
+        "/menu — Show this menu"
     )
 
-def scan(update, context):
+
+def scan(update: Update, context: CallbackContext):
     signal = scan_market()
     update.message.reply_text(signal)
 
-def logs(update, context):
-    log_data = get_trade_logs()
-    update.message.reply_text(log_data)
 
-def status(update, context):
-    status = get_bot_status()
-    update.message.reply_text(status)
+def logs(update: Update, context: CallbackContext):
+    logs = get_trade_logs()
+    update.message.reply_text(logs)
 
-def results(update, context):
-    summary = get_results_summary()
-    update.message.reply_text(summary)
 
-def check_data(update, context):
-    result = check_data_connection()
+def status(update: Update, context: CallbackContext):
+    status_info = get_bot_status()
+    update.message.reply_text(status_info)
+
+
+def results(update: Update, context: CallbackContext):
+    result = get_results()
     update.message.reply_text(result)
 
+
+def check_data(update: Update, context: CallbackContext):
+    result = check_data_source()
+    update.message.reply_text(result)
+
+
+# === Main Entry Point ===
 def main():
     updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
@@ -66,5 +77,6 @@ def main():
     updater.start_polling()
     updater.idle()
 
-if __name__ == "__main__":
+
+if name == "__main__":
     main()
