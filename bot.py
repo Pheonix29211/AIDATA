@@ -1,96 +1,102 @@
 import os
 import time
-import logging
-from telegram import Update, Bot
-from telegram.ext import Updater, CommandHandler, CallbackContext
+from telegram.ext import Updater, CommandHandler
 from utils import (
     scan_market,
     get_trade_logs,
     get_results,
-    get_status,
-    check_data_source,
+    check_data_source
 )
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 TOKEN = os.getenv("TOKEN")
-ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID")
+if not TOKEN:
+    raise ValueError("Bot token missing. Set TOKEN env variable.")
 
 last_trade_time = 0
-scan_interval = 300  # 5 minutes
+active_trade = None
+TRADE_TIMEOUT = 60 * 30  # 30 mins timeout between trades
 
-def restricted(func):
-    def wrapped(update: Update, context: CallbackContext, *args, **kwargs):
-        if ALLOWED_CHAT_ID and str(update.effective_chat.id) != ALLOWED_CHAT_ID:
-            update.message.reply_text("❌ Access denied.")
-            return
-        return func(update, context, *args, **kwargs)
-    return wrapped
+def start(update, context):
+    update.message.reply_text("🌀 Welcome to SpiralBot BTC\nUse /menu to see available commands.")
 
-@restricted
-def scan_command(update: Update, context: CallbackContext):
-    result = scan_market()
-    update.message.reply_text(result)
+def menu(update, context):
+    update.message.reply_text(
+        """🌀 SpiralBot Menu:
+/scan — Manual signal check
+/logs — Last 30 trades
+/status — Current strategy details
+/results — Performance summary
+/check_data — Verify data source"""
+    )
 
-@restricted
-def logs_command(update: Update, context: CallbackContext):
+def scan(update, context):
+    global last_trade_time, active_trade
+
+    now = time.time()
+    if active_trade and (now - last_trade_time < TRADE_TIMEOUT):
+        update.message.reply_text("⏳ Waiting for previous trade to finish...")
+        return
+
+    trade, msg = scan_market()
+    if trade:
+        active_trade = trade
+        last_trade_time = now
+    update.message.reply_text(msg)
+
+def logs(update, context):
     logs = get_trade_logs()
-    update.message.reply_text(logs)
+    if not logs:
+        update.message.reply_text("No trades yet.")
+        return
 
-@restricted
-def status_command(update: Update, context: CallbackContext):
-    status = get_status()
-    update.message.reply_text(status)
+    recent = logs[-30:]
+    formatted = "\n".join([
+        f"{t['type'].upper()} @ {round(t['price'])} | Score: {t['score']} | Outcome: {t.get('outcome', '-')}"
+        for t in reversed(recent)
+    ])
+    update.message.reply_text(f"📊 Last {len(recent)} trades:\n{formatted}")
 
-@restricted
-def results_command(update: Update, context: CallbackContext):
-    results = get_results()
-    update.message.reply_text(results)
+def results(update, context):
+    winrate, wins, losses, avg_score = get_results()
+    update.message.reply_text(
+        f"""📈 Performance Stats:
+Wins: {wins}
+Losses: {losses}
+Win Rate: {winrate}%
+Avg Score: {avg_score}"""
+    )
 
-@restricted
-def check_data(update: Update, context: CallbackContext):
+def status(update, context):
+    update.message.reply_text(
+        """📡 Current Strategy:
+• RSI < 30 (long), > 70 (short)
+• VWAP trend confirmation
+• Engulfing candle required
+• Wick% > 20
+• Liquidation > $250k
+• SL: -$300
+• TP: $600–1500+
+• 1m + 5m VWAP/EMA momentum pings"""
+    )
+
+def check_data(update, context):
     result = check_data_source()
     update.message.reply_text(result)
 
-@restricted
-def menu(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "🌀 SpiralBot Menu:\n"
-        "/scan — Manual scan\n"
-        "/logs — Last 30 trades\n"
-        "/status — Current logic\n"
-        "/results — Win stats\n"
-        "/check_data — Verify data source\n"
-        "/menu — Show this menu"
-    )
-
-def auto_scan(context: CallbackContext):
-    global last_trade_time
-    now = time.time()
-    if now - last_trade_time >= scan_interval:
-        result = scan_market()
-        context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=result)
-        last_trade_time = now
-
 def main():
-    if not TOKEN:
-        raise ValueError("❌ TOKEN is not set in environment variables.")
     updater = Updater(TOKEN, use_context=True)
-    dispatcher = updater.dispatcher
+    dp = updater.dispatcher
 
-    dispatcher.add_handler(CommandHandler("scan", scan_command))
-    dispatcher.add_handler(CommandHandler("logs", logs_command))
-    dispatcher.add_handler(CommandHandler("status", status_command))
-    dispatcher.add_handler(CommandHandler("results", results_command))
-    dispatcher.add_handler(CommandHandler("check_data", check_data))
-    dispatcher.add_handler(CommandHandler("menu", menu))
-
-    job_queue = updater.job_queue
-    job_queue.run_repeating(auto_scan, interval=60, first=10)  # Auto scan every 1 min
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("menu", menu))
+    dp.add_handler(CommandHandler("scan", scan))
+    dp.add_handler(CommandHandler("logs", logs))
+    dp.add_handler(CommandHandler("results", results))
+    dp.add_handler(CommandHandler("status", status))
+    dp.add_handler(CommandHandler("check_data", check_data))
 
     updater.start_polling()
     updater.idle()
 
-if name == "__main__":
+if __name__ == "__main__":
     main()
