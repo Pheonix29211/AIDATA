@@ -8,21 +8,19 @@ from datetime import datetime
 
 TRADE_LOG_FILE = "trade_logs.json"
 
-# ------------- HTTP hardening -------------
+# ---------------- HTTP hardening ----------------
 REQUEST_HEADERS = {"User-Agent": "SpiralBot/1.0 (+render)"}
 
 def _safe_json(resp):
-    ctype = (resp.headers.get("Content-Type") or "").lower()
     txt = (resp.text or "").strip()
     if not txt:
         return None
-    # some APIs return no content-type; try json but guard
     try:
         return resp.json()
     except Exception:
         return None
 
-# ------------- Trade logs -------------
+# ---------------- Trade logs ----------------
 def _ensure_log_file():
     if not os.path.exists(TRADE_LOG_FILE):
         with open(TRADE_LOG_FILE, "w") as f:
@@ -47,10 +45,6 @@ def get_trade_logs(limit=30):
     return trades[-limit:] if trades else []
 
 def get_results():
-    """
-    Return (total, wins, win_rate, avg_score) to match bot.py expectations.
-    Score is optional in saved trades; default to 0.
-    """
     trades = load_trades()
     total = len(trades)
     if total == 0:
@@ -61,51 +55,71 @@ def get_results():
     avg_score = round(float(np.mean(scores)) if scores else 0.0, 2)
     return (total, wins, win_rate, avg_score)
 
-# ------------- Data fetchers -------------
+# ---------------- Data fetchers ----------------
 def fetch_mexc_data(interval="5m", limit=200, retries=2):
     """
-    MEXC public klines; no symbol needed by caller.
-    Try v3 (BTCUSDT) first, then v2 (BTC_USDT). Returns DataFrame with:
-    columns = [time, open, high, low, close, volume]
+    Robust MEXC fetch (no symbol required by caller):
+      1) Open API v3 (BTC_USDT, returns {"data":[...]})
+      2) Official v3 (BTCUSDT, returns array)
+      3) Open API v2 (BTC_USDT, uses 'type' e.g., 5min)
+    Returns DataFrame with columns: [time, open, high, low, close, volume] or None.
     """
     headers = REQUEST_HEADERS
     lim = min(int(limit), 1000)
 
-    # v3 first
+    # ---- (1) Open API v3 ----
+    # https://www.mexc.com/open/api/v3/market/kline?symbol=BTC_USDT&interval=5m&limit=200
+    v3_open_url = "https://www.mexc.com/open/api/v3/market/kline"
+    v3_open_params = {"symbol": "BTC_USDT", "interval": interval, "limit": min(lim, 500)}
+    for _ in range(retries + 1):
+        try:
+            r = requests.get(v3_open_url, params=v3_open_params, headers=headers, timeout=10)
+            j = _safe_json(r)
+            if isinstance(j, dict) and isinstance(j.get("data"), list) and j["data"]:
+                df = pd.DataFrame(j["data"], columns=["time","open","high","low","close","volume","turnover"])
+                for col in ("open","high","low","close","volume"):
+                    df[col] = df[col].astype(float)
+                return df[["time","open","high","low","close","volume"]]
+        except Exception:
+            pass
+        time.sleep(0.25)
+
+    # ---- (2) Official v3 (array) ----
+    # https://api.mexc.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=200
     v3_url = "https://api.mexc.com/api/v3/klines"
     v3_params = {"symbol": "BTCUSDT", "interval": interval, "limit": lim}
     for _ in range(retries + 1):
         try:
             r = requests.get(v3_url, params=v3_params, headers=headers, timeout=10)
-            data = _safe_json(r)
-            if isinstance(data, list) and data:
-                df = pd.DataFrame(
-                    data,
-                    columns=[
-                        "open_time","open","high","low","close","volume",
-                        "close_time","qav","trades","taker_base","taker_quote","ignore"
-                    ],
-                )
-                for col in ("open", "high", "low", "close", "volume"):
+            arr = _safe_json(r)
+            if isinstance(arr, list) and arr:
+                df = pd.DataFrame(arr, columns=[
+                    "open_time","open","high","low","close","volume",
+                    "close_time","qav","trades","taker_base","taker_quote","ignore"
+                ])
+                for col in ("open","high","low","close","volume"):
                     df[col] = df[col].astype(float)
-                df["time"] = df["close_time"]  # unify with other feeds
-                return df[["time", "open", "high", "low", "close", "volume"]]
+                df["time"] = df["close_time"]  # unify
+                return df[["time","open","high","low","close","volume"]]
         except Exception:
             pass
         time.sleep(0.25)
 
-    # v2 fallback
+    # ---- (3) Open API v2 (uses 'type' not 'interval') ----
+    # https://www.mexc.com/open/api/v2/market/kline?symbol=BTC_USDT&type=5min&limit=200
+    interval_map = {"1m":"1min","5m":"5min","15m":"15min","30m":"30min","60m":"60min"}
+    v2_type = interval_map.get(interval, "5min")
     v2_url = "https://www.mexc.com/open/api/v2/market/kline"
-    v2_params = {"symbol": "BTC_USDT", "interval": interval, "limit": min(lim, 500)}
+    v2_params = {"symbol": "BTC_USDT", "type": v2_type, "limit": min(lim, 500)}
     for _ in range(retries + 1):
         try:
             r = requests.get(v2_url, params=v2_params, headers=headers, timeout=10)
             j = _safe_json(r)
-            if j and isinstance(j.get("data"), list) and j["data"]:
-                df = pd.DataFrame(j["data"], columns=["time", "open", "high", "low", "close", "volume"])
-                for col in ("open", "high", "low", "close", "volume"):
+            if isinstance(j, dict) and isinstance(j.get("data"), list) and j["data"]:
+                df = pd.DataFrame(j["data"], columns=["time","open","high","low","close","volume"])
+                for col in ("open","high","low","close","volume"):
                     df[col] = df[col].astype(float)
-                return df[["time", "open", "high", "low", "close", "volume"]]
+                return df[["time","open","high","low","close","volume"]]
         except Exception:
             pass
         time.sleep(0.25)
@@ -114,8 +128,8 @@ def fetch_mexc_data(interval="5m", limit=200, retries=2):
 
 def fetch_bybit_data(interval="5", limit=200, retries=2):
     """
-    Bybit public klines (linear BTCUSDT). Returns DataFrame with:
-    columns = [time, open, high, low, close, volume]
+    Bybit public klines (linear BTCUSDT).
+    Returns DataFrame with columns: [time, open, high, low, close, volume] or None.
     """
     url = "https://api.bybit.com/v5/market/kline"
     params = {"category": "linear", "symbol": "BTCUSDT", "interval": interval, "limit": min(int(limit), 200)}
@@ -125,10 +139,10 @@ def fetch_bybit_data(interval="5", limit=200, retries=2):
             r = requests.get(url, params=params, headers=headers, timeout=10)
             j = _safe_json(r)
             if j and "result" in j and "list" in j["result"] and j["result"]["list"]:
-                df = pd.DataFrame(j["result"]["list"], columns=["time", "open", "high", "low", "close", "volume", "turnover"])
-                for col in ("open", "high", "low", "close", "volume"):
+                df = pd.DataFrame(j["result"]["list"], columns=["time","open","high","low","close","volume","turnover"])
+                for col in ("open","high","low","close","volume"):
                     df[col] = df[col].astype(float)
-                return df[["time", "open", "high", "low", "close", "volume"]]
+                return df[["time","open","high","low","close","volume"]]
         except Exception:
             pass
         time.sleep(0.25)
@@ -147,13 +161,11 @@ def check_data_source():
         pass
     return "❌ Failed to connect to MEXC and BYBIT"
 
-# ------------- Indicators -------------
+# ---------------- Indicators ----------------
 def calculate_vwap(df):
-    # VWAP proxy from close*volume cumulatives
     cum_q = (df["close"] * df["volume"]).cumsum()
     cum_v = df["volume"].cumsum().replace(0, np.nan)
-    vwap = (cum_q / cum_v).fillna(df["close"])
-    return vwap
+    return (cum_q / cum_v).fillna(df["close"])
 
 def calculate_ema(df, period):
     return df["close"].ewm(span=period, adjust=False).mean()
@@ -180,7 +192,6 @@ def detect_engulfing(df):
         out.append("bullish" if bull else "bearish" if bear else None)
     return out
 
-# ------------- Signal logic -------------
 def _compute_indicators(df):
     df = df.copy()
     df["ema_fast"] = calculate_ema(df, 9)
@@ -191,9 +202,6 @@ def _compute_indicators(df):
     return df
 
 def detect_signal(df):
-    """
-    Basic filter: EMA cross + VWAP side + engulf + RSI bias
-    """
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
@@ -218,7 +226,7 @@ def detect_signal(df):
         return "short"
     return None
 
-# ------------- Market scan (used by /scan & /forcescan) -------------
+# ---------------- Scanner ----------------
 def scan_market():
     df = fetch_mexc_data()
     source = "MEXC"
@@ -235,9 +243,7 @@ def scan_market():
         sl  = price - 300 if sig == "long" else price + 300
         tp1 = price + 600 if sig == "long" else price - 600
         tp2 = price + 1500 if sig == "long" else price - 1500
-
-        # optional score for future learning (simple composite)
-        score = 2.5
+        score = 2.5  # placeholder for future learning score
 
         save_trade({
             "time": datetime.utcnow().isoformat(),
@@ -247,7 +253,7 @@ def scan_market():
             "tp1": tp1,
             "tp2": tp2,
             "score": score,
-            "result": ""  # to be filled later by your evaluator
+            "result": ""
         })
 
         title = f"🚨 {sig.upper()} Signal ({source})"
@@ -256,11 +262,8 @@ def scan_market():
 
     return None, f"No signal at the moment. ({source})"
 
-# ------------- Backtest stream (used by /backtest) -------------
+# ---------------- Backtest stream ----------------
 def run_backtest_stream(days=2):
-    """
-    Replays recent candles and emits entry/TP/SL events using same rules as scan_market().
-    """
     df = fetch_mexc_data()
     source = "MEXC"
     if df is None:
