@@ -102,6 +102,46 @@ def fetch_mexc_data(interval="5m", limit=200, retries=2):
     return None
 
 
+# ====== utils.py PATCH: robust data sources (MEXC v3, OKX, Binance, Bybit) ======
+
+def fetch_mexc_data(interval="5m", limit=200, retries=2):
+    """
+    MEXC v3 official first. (We avoid v3-open if it serves HTML/404.)
+    Returns DataFrame [time, open, high, low, close, volume] or None.
+    """
+    import requests, pandas as pd, time
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 SpiralBot",
+        "Accept": "application/json,text/plain,*/*",
+        "Connection": "keep-alive",
+    }
+    lim = min(int(limit), 1000)
+
+    # (1) Official v3 (array)
+    v3_url = "https://api.mexc.com/api/v3/klines"
+    v3_params = {"symbol": "BTCUSDT", "interval": interval, "limit": lim}
+    for _ in range(retries + 1):
+        try:
+            r = requests.get(v3_url, params=v3_params, headers=headers, timeout=10, allow_redirects=True)
+            LAST_FETCH_DEBUG["mexc"] = f"v3-official {r.status_code} | {(r.text or '')[:120].replace(chr(10),' ')}"
+            arr = _safe_json(r)
+            if isinstance(arr, list) and arr:
+                df = pd.DataFrame(arr, columns=[
+                    "open_time","open","high","low","close","volume",
+                    "close_time","qav","trades","taker_base","taker_quote","ignore"
+                ])
+                for col in ("open","high","low","close","volume"):
+                    df[col] = df[col].astype(float)
+                df["time"] = df["close_time"]
+                return df[["time","open","high","low","close","volume"]]
+        except Exception:
+            pass
+        time.sleep(0.25)
+
+    return None
+
+
 def fetch_okx_data(interval="5m", limit=200, retries=2):
     """
     OKX keyless public candles. instId=BTC-USDT, bar=5m/1m.
@@ -218,6 +258,7 @@ def check_data_source():
     except Exception:
         pass
     return "❌ Failed to connect to MEXC/OKX/BINANCE/BYBIT.\n\nDiag:\n" + quick_diag()
+
 
 # ---------------- Indicators ----------------
 def calculate_vwap(df):
