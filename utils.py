@@ -6,11 +6,16 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
+# =========================
+# File storage for trade log
+# =========================
 TRADE_LOG_FILE = "trade_logs.json"
 
-# ---------------- HTTP hardening & diag ----------------
-REQUEST_HEADERS = {"User-Agent": "SpiralBot/1.0 (+render)"}
-LAST_FETCH_DEBUG = {"mexc": "", "bybit": ""}
+# =========================
+# Diagnostics helpers
+# =========================
+REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 SpiralBot"}
+LAST_FETCH_DEBUG = {"mexc": "", "okx": "", "binance": "", "bybit": ""}
 
 def _safe_json(resp):
     txt = (resp.text or "").strip()
@@ -22,11 +27,16 @@ def _safe_json(resp):
         return None
 
 def quick_diag():
-    m = LAST_FETCH_DEBUG.get("mexc","no call yet")
-    b = LAST_FETCH_DEBUG.get("bybit","no call yet")
-    return f"MEXC: {m}\nBYBIT: {b}"
+    return (
+        f"MEXC: {LAST_FETCH_DEBUG.get('mexc','no call yet')}\n"
+        f"OKX: {LAST_FETCH_DEBUG.get('okx','no call yet')}\n"
+        f"BINANCE: {LAST_FETCH_DEBUG.get('binance','no call yet')}\n"
+        f"BYBIT: {LAST_FETCH_DEBUG.get('bybit','no call yet')}"
+    )
 
-# ---------------- Trade logs ----------------
+# =========================
+# Trade logs
+# =========================
 def _ensure_log_file():
     if not os.path.exists(TRADE_LOG_FILE):
         with open(TRADE_LOG_FILE, "w") as f:
@@ -61,16 +71,14 @@ def get_results():
     avg_score = round(float(np.mean(scores)) if scores else 0.0, 2)
     return (total, wins, win_rate, avg_score)
 
-# ---------------- Data fetchers ----------------
-# ====== utils.py PATCH: robust data sources (MEXC v3, OKX, Binance, Bybit) ======
-
+# =========================
+# Data fetchers (MEXC -> OKX -> Binance -> Bybit)
+# =========================
 def fetch_mexc_data(interval="5m", limit=200, retries=2):
     """
-    MEXC v3 official first. (We avoid v3-open if it serves HTML/404.)
+    MEXC v3 official klines (array of arrays; column count can vary).
     Returns DataFrame [time, open, high, low, close, volume] or None.
     """
-    import requests, pandas as pd, time
-
     headers = {
         "User-Agent": "Mozilla/5.0 SpiralBot",
         "Accept": "application/json,text/plain,*/*",
@@ -78,76 +86,49 @@ def fetch_mexc_data(interval="5m", limit=200, retries=2):
     }
     lim = min(int(limit), 1000)
 
-    # (1) Official v3 (array)
-    v3_url = "https://api.mexc.com/api/v3/klines"
-    v3_params = {"symbol": "BTCUSDT", "interval": interval, "limit": lim}
+    url = "https://api.mexc.com/api/v3/klines"
+    params = {"symbol": "BTCUSDT", "interval": interval, "limit": lim}
+
     for _ in range(retries + 1):
         try:
-            r = requests.get(v3_url, params=v3_params, headers=headers, timeout=10, allow_redirects=True)
+            r = requests.get(url, params=params, headers=headers, timeout=10, allow_redirects=True)
             LAST_FETCH_DEBUG["mexc"] = f"v3-official {r.status_code} | {(r.text or '')[:120].replace(chr(10),' ')}"
             arr = _safe_json(r)
             if isinstance(arr, list) and arr:
-                df = pd.DataFrame(arr, columns=[
-                    "open_time","open","high","low","close","volume",
-                    "close_time","qav","trades","taker_base","taker_quote","ignore"
-                ])
-                for col in ("open","high","low","close","volume"):
-                    df[col] = df[col].astype(float)
-                df["time"] = df["close_time"]
-                return df[["time","open","high","low","close","volume"]]
+                # Flexible mapping (MEXC sometimes returns 8 columns, sometimes more).
+                df_raw = pd.DataFrame(arr)
+                # Expected order: [open_time, open, high, low, close, volume, close_time, ...]
+                open_   = pd.to_numeric(df_raw.iloc[:, 1], errors="coerce")
+                high_   = pd.to_numeric(df_raw.iloc[:, 2], errors="coerce")
+                low_    = pd.to_numeric(df_raw.iloc[:, 3], errors="coerce")
+                close_  = pd.to_numeric(df_raw.iloc[:, 4], errors="coerce")
+                volume_ = pd.to_numeric(df_raw.iloc[:, 5], errors="coerce")
+                timecol = df_raw.iloc[:, 6] if df_raw.shape[1] >= 7 else df_raw.iloc[:, 0]
+                time_   = pd.to_numeric(timecol, errors="coerce").astype("Int64")
+
+                df = pd.DataFrame({
+                    "time":   time_,
+                    "open":   open_,
+                    "high":   high_,
+                    "low":    low_,
+                    "close":  close_,
+                    "volume": volume_,
+                }).dropna()
+
+                if len(df) > 0:
+                    df["time"] = df["time"].astype("int64")
+                    return df
         except Exception:
             pass
         time.sleep(0.25)
 
     return None
-
-
-# ====== utils.py PATCH: robust data sources (MEXC v3, OKX, Binance, Bybit) ======
-
-def fetch_mexc_data(interval="5m", limit=200, retries=2):
-    """
-    MEXC v3 official first. (We avoid v3-open if it serves HTML/404.)
-    Returns DataFrame [time, open, high, low, close, volume] or None.
-    """
-    import requests, pandas as pd, time
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 SpiralBot",
-        "Accept": "application/json,text/plain,*/*",
-        "Connection": "keep-alive",
-    }
-    lim = min(int(limit), 1000)
-
-    # (1) Official v3 (array)
-    v3_url = "https://api.mexc.com/api/v3/klines"
-    v3_params = {"symbol": "BTCUSDT", "interval": interval, "limit": lim}
-    for _ in range(retries + 1):
-        try:
-            r = requests.get(v3_url, params=v3_params, headers=headers, timeout=10, allow_redirects=True)
-            LAST_FETCH_DEBUG["mexc"] = f"v3-official {r.status_code} | {(r.text or '')[:120].replace(chr(10),' ')}"
-            arr = _safe_json(r)
-            if isinstance(arr, list) and arr:
-                df = pd.DataFrame(arr, columns=[
-                    "open_time","open","high","low","close","volume",
-                    "close_time","qav","trades","taker_base","taker_quote","ignore"
-                ])
-                for col in ("open","high","low","close","volume"):
-                    df[col] = df[col].astype(float)
-                df["time"] = df["close_time"]
-                return df[["time","open","high","low","close","volume"]]
-        except Exception:
-            pass
-        time.sleep(0.25)
-
-    return None
-
 
 def fetch_okx_data(interval="5m", limit=200, retries=2):
     """
-    OKX keyless public candles. instId=BTC-USDT, bar=5m/1m.
+    OKX keyless public candles. instId=BTC-USDT, bar=5m/1m/etc.
     Returns DataFrame [time, open, high, low, close, volume] or None.
     """
-    import requests, pandas as pd, time
     bar_map = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "60m": "1H"}
     bar = bar_map.get(interval, "5m")
     url = "https://www.okx.com/api/v5/market/candles"
@@ -157,56 +138,63 @@ def fetch_okx_data(interval="5m", limit=200, retries=2):
     for _ in range(retries + 1):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=10)
-            txt = (r.text or "")[:120].replace("\n", " ")
-            LAST_FETCH_DEBUG["mexc"] = f"OKX {r.status_code} | {txt}"
+            LAST_FETCH_DEBUG["okx"] = f"OKX {r.status_code} | {(r.text or '')[:120].replace(chr(10),' ')}"
             j = _safe_json(r)
-            # OKX returns {"code":"0","data":[ [ts, o,h,l,c,vol, volCcy] ... ]}
+            # OKX returns {"code":"0","data":[ [ts, o,h,l,c, vol, volCcy, ...] ]}
             if j and j.get("code") == "0" and isinstance(j.get("data"), list) and j["data"]:
                 arr = j["data"][::-1]  # chronological
-                cols = ["time","open","high","low","close","volume","volccy"]
-                df = pd.DataFrame(arr, columns=cols)
-                for col in ("open","high","low","close","volume"):
-                    df[col] = df[col].astype(float)
-                return df[["time","open","high","low","close","volume"]]
+                df_raw = pd.DataFrame(arr)
+                df = pd.DataFrame({
+                    "time":   pd.to_numeric(df_raw.iloc[:, 0], errors="coerce").astype("int64"),
+                    "open":   pd.to_numeric(df_raw.iloc[:, 1], errors="coerce"),
+                    "high":   pd.to_numeric(df_raw.iloc[:, 2], errors="coerce"),
+                    "low":    pd.to_numeric(df_raw.iloc[:, 3], errors="coerce"),
+                    "close":  pd.to_numeric(df_raw.iloc[:, 4], errors="coerce"),
+                    "volume": pd.to_numeric(df_raw.iloc[:, 5], errors="coerce"),
+                }).dropna()
+                if len(df) > 0:
+                    return df
         except Exception:
             pass
         time.sleep(0.25)
     return None
 
-
 def fetch_binance_data(interval="5m", limit=200, retries=1):
     """
-    Binance spot klines (BTCUSDT). Enabled by default as fallback.
+    Binance spot klines (BTCUSDT). Free, reliable fallback.
+    Returns DataFrame [time, open, high, low, close, volume] or None.
     """
-    import requests, pandas as pd, time
     url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": "BTCUSDT", "interval": interval, "limit": min(int(limit), 1000)}
     headers = {"User-Agent": "Mozilla/5.0 SpiralBot"}
     for _ in range(retries + 1):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=10)
-            LAST_FETCH_DEBUG["bybit"] = f"BINANCE {r.status_code} | {(r.text or '')[:120].replace(chr(10),' ')}"
+            LAST_FETCH_DEBUG["binance"] = f"BINANCE {r.status_code} | {(r.text or '')[:120].replace(chr(10),' ')}"
             arr = _safe_json(r)
             if isinstance(arr, list) and arr:
-                df = pd.DataFrame(arr, columns=[
-                    "open_time","open","high","low","close","volume",
-                    "close_time","qav","trades","tbbav","tbqav","ignore"
-                ])
-                for col in ("open","high","low","close","volume"):
-                    df[col] = df[col].astype(float)
-                df["time"] = df["close_time"]
-                return df[["time","open","high","low","close","volume"]]
+                df_raw = pd.DataFrame(arr)
+                # Binance: [open_time, open, high, low, close, volume, close_time, ...]
+                df = pd.DataFrame({
+                    "time":   pd.to_numeric(df_raw.iloc[:, 6], errors="coerce").astype("int64"),  # close_time
+                    "open":   pd.to_numeric(df_raw.iloc[:, 1], errors="coerce"),
+                    "high":   pd.to_numeric(df_raw.iloc[:, 2], errors="coerce"),
+                    "low":    pd.to_numeric(df_raw.iloc[:, 3], errors="coerce"),
+                    "close":  pd.to_numeric(df_raw.iloc[:, 4], errors="coerce"),
+                    "volume": pd.to_numeric(df_raw.iloc[:, 5], errors="coerce"),
+                }).dropna()
+                if len(df) > 0:
+                    return df
         except Exception:
             pass
         time.sleep(0.25)
     return None
 
-
 def fetch_bybit_data(interval="5", limit=200, retries=1):
     """
-    Bybit public klines (linear BTCUSDT). CF often blocks; keep as last fallback.
+    Bybit public klines (linear BTCUSDT). May 403 behind CF; last resort.
+    Returns DataFrame [time, open, high, low, close, volume] or None.
     """
-    import requests, pandas as pd, time
     url = "https://api.bybit.com/v5/market/kline"
     params = {"category": "linear", "symbol": "BTCUSDT", "interval": interval, "limit": min(int(limit), 200)}
     headers = {
@@ -222,36 +210,51 @@ def fetch_bybit_data(interval="5", limit=200, retries=1):
             LAST_FETCH_DEBUG["bybit"] = f"BYBIT {r.status_code} | {(r.text or '')[:120].replace(chr(10),' ')}"
             j = _safe_json(r)
             if j and "result" in j and "list" in j["result"] and j["result"]["list"]:
-                df = pd.DataFrame(j["result"]["list"], columns=["time","open","high","low","close","volume","turnover"])
-                for col in ("open","high","low","close","volume"):
-                    df[col] = df[col].astype(float)
-                return df[["time","open","high","low","close","volume"]]
+                df_raw = pd.DataFrame(j["result"]["list"])
+                df = pd.DataFrame({
+                    "time":   pd.to_numeric(df_raw.iloc[:, 0], errors="coerce").astype("int64"),
+                    "open":   pd.to_numeric(df_raw.iloc[:, 1], errors="coerce"),
+                    "high":   pd.to_numeric(df_raw.iloc[:, 2], errors="coerce"),
+                    "low":    pd.to_numeric(df_raw.iloc[:, 3], errors="coerce"),
+                    "close":  pd.to_numeric(df_raw.iloc[:, 4], errors="coerce"),
+                    "volume": pd.to_numeric(df_raw.iloc[:, 5], errors="coerce"),
+                }).dropna()
+                if len(df) > 0:
+                    return df
         except Exception:
             pass
         time.sleep(0.25)
     return None
 
+def _get_live_df(interval="5m", limit=200):
+    """
+    Try MEXC -> OKX -> Binance -> Bybit. Returns (df, source).
+    """
+    df = fetch_mexc_data(interval=interval, limit=limit); src = "MEXC"
+    if df is None:
+        df = fetch_okx_data(interval=interval, limit=limit); src = "OKX"
+    if df is None:
+        df = fetch_binance_data(interval=interval, limit=limit); src = "BINANCE"
+    if df is None:
+        df = fetch_bybit_data(interval="5", limit=limit); src = "BYBIT"  # Bybit uses numeric intervals like "5"
+    return df, src
 
 def check_data_source():
-    # 1) MEXC official v3
     try:
         if fetch_mexc_data(limit=2) is not None:
             return "✅ Connected to MEXC"
     except Exception:
         pass
-    # 2) OKX public
     try:
         if fetch_okx_data(limit=2) is not None:
             return "✅ Connected to OKX"
     except Exception:
         pass
-    # 3) Binance fallback
     try:
         if fetch_binance_data(limit=2) is not None:
             return "✅ Connected to BINANCE"
     except Exception:
         pass
-    # 4) Bybit last
     try:
         if fetch_bybit_data(limit=2) is not None:
             return "✅ Connected to BYBIT"
@@ -259,8 +262,9 @@ def check_data_source():
         pass
     return "❌ Failed to connect to MEXC/OKX/BINANCE/BYBIT.\n\nDiag:\n" + quick_diag()
 
-
-# ---------------- Indicators ----------------
+# =========================
+# Indicators & signals
+# =========================
 def calculate_vwap(df):
     cum_q = (df["close"] * df["volume"]).cumsum()
     cum_v = df["volume"].cumsum().replace(0, np.nan)
@@ -325,16 +329,18 @@ def detect_signal(df):
         return "short"
     return None
 
-# ---------------- Scanner ----------------
+# =========================
+# Scanner + Backtest
+# =========================
 def scan_market():
-    df = fetch_mexc_data()
-    source = "MEXC"
-    if df is None:
-        df = fetch_bybit_data()
-        source = "BYBIT"
+    """
+    Returns (title, body) for a signal, or (None, status_text) if no signal / data.
+    Uses 5m bars, TP1 $600, TP2 $1500, SL $300.
+    """
+    df, source = _get_live_df(interval="5m", limit=200)
     if df is None or len(df) < 30:
         dbg = quick_diag()
-        return None, f"❌ Data Error:\nNo data from MEXC or BYBIT.\n\nDiag:\n{dbg}\nTry /forcescan again."
+        return None, f"❌ Data Error:\nNo data from MEXC/OKX/BINANCE/BYBIT.\n\nDiag:\n{dbg}\nTry /forcescan again."
 
     df = _compute_indicators(df)
     sig = detect_signal(df)
@@ -343,7 +349,7 @@ def scan_market():
         sl  = price - 300 if sig == "long" else price + 300
         tp1 = price + 600 if sig == "long" else price - 600
         tp2 = price + 1500 if sig == "long" else price - 1500
-        score = 2.5  # placeholder
+        score = 2.5  # placeholder until ML scoring is added
 
         save_trade({
             "time": datetime.utcnow().isoformat(),
@@ -362,18 +368,16 @@ def scan_market():
 
     return None, f"No signal at the moment. ({source})"
 
-# ---------------- Backtest stream ----------------
 def run_backtest_stream(days=2):
-    df = fetch_mexc_data()
-    source = "MEXC"
-    if df is None:
-        df = fetch_bybit_data()
-        source = "BYBIT"
+    """
+    Lightweight sequential backtest on the last ~500 5m bars.
+    Emits human-readable lines (entries/TP/SL) using current rules.
+    """
+    df, source = _get_live_df(interval="5m", limit=500)
     if df is None or len(df) < 50:
-        return [f"❌ Backtest: unable to fetch history from MEXC or BYBIT."]
+        return [f"❌ Backtest: unable to fetch history from MEXC/OKX/BINANCE/BYBIT."]
 
     df = _compute_indicators(df)
-
     lines = []
     active = None  # {"dir","entry","sl","tp1","tp2"}
 
@@ -381,7 +385,7 @@ def run_backtest_stream(days=2):
         row = df.iloc[i]
         price = float(row["close"])
 
-        # manage open
+        # Manage open trade
         if active:
             if active["dir"] == "long":
                 if price >= active["tp2"]:
@@ -402,7 +406,7 @@ def run_backtest_stream(days=2):
                     lines.append(f"❌ SL hit @ {round(price)} (-$300) [{source}]")
                     active = None
 
-        # look for new entry if flat
+        # Look for new entry if flat
         if not active:
             seg = df.iloc[: i+1]
             sig = detect_signal(seg)
