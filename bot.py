@@ -3,6 +3,7 @@ import time
 import logging
 import threading
 from telegram.ext import Updater, CommandHandler
+from telegram.error import TelegramError
 from utils import (
     scan_market,
     get_trade_logs,
@@ -35,8 +36,7 @@ def menu(update, context):
     )
 
 def scan_command(update, context):
-    # Backward-compatible handling: utils.scan_market() returns (signal_text_or_None, msg_or_None)
-    a, b = scan_market()
+    a, b = scan_market()  # (signal_text_or_None, msg_or_None)
     text = a if a else b if b else "No signal."
     update.message.reply_text(text)
 
@@ -52,13 +52,13 @@ def logs_command(update, context):
         update.message.reply_text("No trades yet.")
         return
     lines = []
-    for t in reversed(logs):
+    for t in reversed(logs[-30:]):
         lines.append(
             f"{t.get('time','-')} | {t.get('direction','-')} @ {round(t.get('entry',0))} | "
             f"SL {round(t.get('sl',0))} TP {round(t.get('tp',0))} | "
-            f"Score {t.get('score','-')} | {t.get('outcome','-')}"
+            f"Score {t.get('score','-')} | {t.get('outcome','')}"
         )
-    msg = "📊 Last trades:\n" + "\n".join(lines[:30])
+    msg = "📊 Last trades:\n" + "\n".join(lines)
     update.message.reply_text(msg[:4000])
 
 def results_command(update, context):
@@ -88,21 +88,32 @@ def backtest_command(update, context):
     update.message.reply_text("🧪 Starting 2-day backtest… streaming entries & outcomes.")
 
     def _runner():
-        # utils.run_backtest_stream currently returns a list of lines OR streams internally.
         try:
             lines = run_backtest_stream(days=2)
-            # If it returned a list, stream them; if it already streamed, lines may be None
             if isinstance(lines, list) and lines:
                 for line in lines:
                     try:
                         context.bot.send_message(chat_id=chat_id, text=line)
-                        time.sleep(1.0)
+                        time.sleep(0.8)
                     except Exception as e:
                         logger.warning(f"send fail: {e}")
         except Exception as e:
             context.bot.send_message(chat_id=chat_id, text=f"❌ Backtest error: {e}")
 
     threading.Thread(target=_runner, daemon=True).start()
+
+# -------------------- Global error handler -------------------- #
+
+def on_error(update, context):
+    try:
+        if update and update.effective_chat:
+            context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="❌ Error: upstream data temporarily unavailable. Try /forcescan again."
+            )
+    except TelegramError:
+        pass
+    logger.exception("Handler error", exc_info=context.error)
 
 # -------------------- Bootstrap (webhook) -------------------- #
 
@@ -131,6 +142,9 @@ def main():
     dp.add_handler(CommandHandler("status", status_command))
     dp.add_handler(CommandHandler("check_data", check_data_command))
     dp.add_handler(CommandHandler("backtest", backtest_command))
+
+    # Errors
+    dp.add_error_handler(on_error)
 
     # Webhook
     webhook_path = TOKEN
