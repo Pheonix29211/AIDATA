@@ -306,21 +306,37 @@ def _compute_indicators(df):
 
 def detect_signal(df):
     latest = df.iloc[-1]
-    prev = df.iloc[-2]
+    prev   = df.iloc[-2]
+
+    # Looser RSI guardrails around 50
+    rsi_ok_long  = latest["rsi"] > 48
+    rsi_ok_short = latest["rsi"] < 52
+
+    # Engulfing is a bonus now; strong RSI can substitute
+    engulf_long_ok  = (latest.get("engulfing") == "bullish")
+    engulf_short_ok = (latest.get("engulfing") == "bearish")
+
+    strong_rsi_long  = latest["rsi"] > 55
+    strong_rsi_short = latest["rsi"] < 45
+
+    # Allow either a fresh cross OR a continuation (already crossed and still aligned)
+    cross_or_continue_long = (prev["ema_fast"] <= prev["ema_slow"]) or (latest["ema_fast"] > latest["ema_slow"])
+    cross_or_continue_short = (prev["ema_fast"] >= prev["ema_slow"]) or (latest["ema_fast"] < latest["ema_slow"])
 
     long_ok = (
         latest["ema_fast"] > latest["ema_slow"] and
         latest["close"] > latest["vwap"] and
-        latest["engulfing"] == "bullish" and
-        latest["rsi"] > 50 and
-        prev["ema_fast"] <= prev["ema_slow"]
+        (engulf_long_ok or strong_rsi_long) and
+        rsi_ok_long and
+        cross_or_continue_long
     )
+
     short_ok = (
         latest["ema_fast"] < latest["ema_slow"] and
         latest["close"] < latest["vwap"] and
-        latest["engulfing"] == "bearish" and
-        latest["rsi"] < 50 and
-        prev["ema_fast"] >= prev["ema_slow"]
+        (engulf_short_ok or strong_rsi_short) and
+        rsi_ok_short and
+        cross_or_continue_short
     )
 
     if long_ok:
