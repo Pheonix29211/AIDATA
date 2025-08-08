@@ -62,20 +62,17 @@ def get_results():
     return (total, wins, win_rate, avg_score)
 
 # ---------------- Data fetchers ----------------
-# ---------- Replace your existing fetchers with these ----------
-
 def fetch_mexc_data(interval="5m", limit=200, retries=2):
     """
-    MEXC-first, v3 only (v2 removed). Tries:
-      1) Official v3 (spot): api.mexc.com/api/v3/klines  (BTCUSDT)
-      2) Open v3 (spot):    www.mexc.com/open/api/v3/market/kline (BTC_USDT)
-      3) Contract v1:       contract.mexc.com/api/v1/contract/kline (BTC_USDT, Min5)
+    MEXC v3 only (no v2, no contract). Tries:
+      1) Official v3: api.mexc.com/api/v3/klines  (BTCUSDT)
+      2) Open v3:    www.mexc.com/open/api/v3/market/kline (BTC_USDT)
     Returns DataFrame [time, open, high, low, close, volume] or None.
     """
     import requests, pandas as pd, time
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) SpiralBot",
+        "User-Agent": "Mozilla/5.0 SpiralBot",
         "Accept": "application/json,text/plain,*/*",
         "Connection": "keep-alive",
         "Origin": "https://www.mexc.com",
@@ -83,7 +80,7 @@ def fetch_mexc_data(interval="5m", limit=200, retries=2):
     }
     lim = min(int(limit), 1000)
 
-    # ---- (1) Official v3 (array) ----
+    # (1) Official v3 (array)
     v3_url = "https://api.mexc.com/api/v3/klines"
     v3_params = {"symbol": "BTCUSDT", "interval": interval, "limit": lim}
     for _ in range(retries + 1):
@@ -104,7 +101,7 @@ def fetch_mexc_data(interval="5m", limit=200, retries=2):
             pass
         time.sleep(0.25)
 
-    # ---- (2) Open v3 (JSON object w/ 'data') ----
+    # (2) Open v3 (object with 'data')
     v3_open_url = "https://www.mexc.com/open/api/v3/market/kline"
     v3_open_params = {"symbol": "BTC_USDT", "interval": interval, "limit": min(lim, 500)}
     for _ in range(retries + 1):
@@ -121,43 +118,19 @@ def fetch_mexc_data(interval="5m", limit=200, retries=2):
             pass
         time.sleep(0.25)
 
-       # ---- (3) MEXC Contract API (futures) ----
-    # expects param name 'type' (not 'interval')
-    # valid values: Min1, Min5, Min15, Min30, Min60, etc.
-    interval_map = {"1m":"Min1","5m":"Min5","15m":"Min15","30m":"Min30","60m":"Min60"}
-    c_type = interval_map.get(interval, "Min5")
-    c_url = "https://contract.mexc.com/api/v1/contract/kline"
-    c_params = {"symbol": "BTC_USDT", "type": c_type, "limit": min(lim, 500)}
-    for _ in range(retries + 1):
-        try:
-            r = requests.get(c_url, params=c_params, headers=headers, timeout=10, allow_redirects=True)
-            LAST_FETCH_DEBUG["mexc"] = f"contract {r.status_code} | {(r.text or '')[:120].replace(chr(10),' ')}"
-            j = _safe_json(r)
-            # response: {"success":true,"code":0,"data":[ [ts,open,high,low,close,vol], ... ]}
-            if j and j.get("success") and isinstance(j.get("data"), list) and j["data"]:
-                df = pd.DataFrame(j["data"], columns=["time","open","high","low","close","volume"])
-                for col in ("open","high","low","close","volume"):
-                    df[col] = df[col].astype(float)
-                return df[["time","open","high","low","close","volume"]]
-        except Exception:
-            pass
-        time.sleep(0.25)
-
-
     return None
 
 
 def fetch_bybit_data(interval="5", limit=200, retries=2):
     """
     Bybit public klines (linear BTCUSDT).
-    Cloudflare can 403; send stronger headers.
-    Returns DataFrame [time, open, high, low, close, volume] or None.
+    May 403 under Cloudflare; keep as best-effort fallback.
     """
     import requests, pandas as pd, time
     url = "https://api.bybit.com/v5/market/kline"
     params = {"category": "linear", "symbol": "BTCUSDT", "interval": interval, "limit": min(int(limit), 200)}
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) SpiralBot",
+        "User-Agent": "Mozilla/5.0 SpiralBot",
         "Accept": "application/json, text/plain, */*",
         "Origin": "https://www.bybit.com",
         "Referer": "https://www.bybit.com/",
@@ -179,13 +152,10 @@ def fetch_bybit_data(interval="5", limit=200, retries=2):
     return None
 
 
-# (Optional) Binance as last-resort fallback — OFF by default.
 def fetch_binance_data(interval="5m", limit=200, retries=1):
     """
-    Binance spot klines (BTCUSDT). Only used if ALLOW_BINANCE=1.
+    Binance spot klines (BTCUSDT). Enabled by default as last-resort fallback.
     """
-    if os.getenv("ALLOW_BINANCE", "0") != "1":
-        return None
     import requests, pandas as pd, time
     url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": "BTCUSDT", "interval": interval, "limit": min(int(limit), 1000)}
@@ -210,7 +180,7 @@ def fetch_binance_data(interval="5m", limit=200, retries=1):
 
 
 def check_data_source():
-    # Try MEXC first (v3 or contract)
+    # Try MEXC v3 (official/open)
     try:
         if fetch_mexc_data(limit=2) is not None:
             return "✅ Connected to MEXC"
@@ -222,15 +192,14 @@ def check_data_source():
             return "✅ Connected to BYBIT"
     except Exception:
         pass
-    # Optional Binance
+    # Then Binance fallback (now ON by default)
     try:
         if fetch_binance_data(limit=2) is not None:
             return "✅ Connected to BINANCE (fallback)"
     except Exception:
         pass
-    # If all fail, show diag detail
-    return "❌ Failed to connect to MEXC/BYBIT.\n\nDiag:\n" + quick_diag()
-
+    # If all fail, show diag
+    return "❌ Failed to connect to MEXC/BYBIT/BINANCE.\n\nDiag:\n" + quick_diag()
 
 # ---------------- Indicators ----------------
 def calculate_vwap(df):
