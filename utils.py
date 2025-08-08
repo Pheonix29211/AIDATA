@@ -121,19 +121,20 @@ def fetch_mexc_data(interval="5m", limit=200, retries=2):
             pass
         time.sleep(0.25)
 
-    # ---- (3) MEXC Contract API (futures) ----
-    # interval mapping: use 'Min5' for 5m, 'Min1' for 1m etc.
+       # ---- (3) MEXC Contract API (futures) ----
+    # expects param name 'type' (not 'interval')
+    # valid values: Min1, Min5, Min15, Min30, Min60, etc.
     interval_map = {"1m":"Min1","5m":"Min5","15m":"Min15","30m":"Min30","60m":"Min60"}
-    c_interval = interval_map.get(interval, "Min5")
+    c_type = interval_map.get(interval, "Min5")
     c_url = "https://contract.mexc.com/api/v1/contract/kline"
-    c_params = {"symbol": "BTC_USDT", "interval": c_interval, "limit": min(lim, 500)}
+    c_params = {"symbol": "BTC_USDT", "type": c_type, "limit": min(lim, 500)}
     for _ in range(retries + 1):
         try:
             r = requests.get(c_url, params=c_params, headers=headers, timeout=10, allow_redirects=True)
             LAST_FETCH_DEBUG["mexc"] = f"contract {r.status_code} | {(r.text or '')[:120].replace(chr(10),' ')}"
             j = _safe_json(r)
-            # returns {"success":true,"code":0,"data":[ [ts,open,high,low,close,vol] ... ]}
-            if j and isinstance(j.get("data"), list) and j["data"]:
+            # response: {"success":true,"code":0,"data":[ [ts,open,high,low,close,vol], ... ]}
+            if j and j.get("success") and isinstance(j.get("data"), list) and j["data"]:
                 df = pd.DataFrame(j["data"], columns=["time","open","high","low","close","volume"])
                 for col in ("open","high","low","close","volume"):
                     df[col] = df[col].astype(float)
@@ -141,6 +142,7 @@ def fetch_mexc_data(interval="5m", limit=200, retries=2):
         except Exception:
             pass
         time.sleep(0.25)
+
 
     return None
 
