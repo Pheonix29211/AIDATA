@@ -1,238 +1,198 @@
 import requests
 import json
-import time
 import os
-from datetime import datetime, timedelta, timezone
-
-# ===== Utility Functions =====
-
-def _now_ms():
-    return int(time.time() * 1000)
-
-def _ms(dt: datetime):
-    return int(dt.timestamp() * 1000)
-
-def _two_days_range_ms():
-    end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    start = end - timedelta(days=2)
-    return _ms(start), _ms(end)
-
-# ===== Indicators =====
-
-def _ema_series(values, period):
-    ema = []
-    k = 2 / (period + 1)
-    for i, price in enumerate(values):
-        if i == 0:
-            ema.append(price)
-        else:
-            ema.append(price * k + ema[-1] * (1 - k))
-    return ema
-
-def _rsi_series(values, period=14):
-    gains, losses = [], []
-    rsi = []
-    for i in range(len(values)):
-        if i == 0:
-            rsi.append(50)
-            continue
-        change = values[i] - values[i-1]
-        gains.append(max(0, change))
-        losses.append(abs(min(0, change)))
-        if len(gains) > period:
-            gains.pop(0)
-            losses.pop(0)
-        avg_gain = sum(gains) / period if len(gains) == period else 0
-        avg_loss = sum(losses) / period if len(losses) == period else 0
-        if avg_loss == 0:
-            rsi.append(100)
-        else:
-            rs = avg_gain / avg_loss
-            rsi.append(100 - (100 / (1 + rs)))
-    return rsi
-
-def _vwap_series(ohlcv, period=20):
-    vwap = []
-    for i in range(len(ohlcv)):
-        if i < period:
-            vwap.append(ohlcv[i][4])
-        else:
-            typical_prices = [sum(ohlcv[j][1:4]) / 3 for j in range(i - period + 1, i + 1)]
-            volumes = [ohlcv[j][5] if len(ohlcv[j]) > 5 else 1 for j in range(i - period + 1, i + 1)]
-            tpv = sum([typical_prices[k] * volumes[k] for k in range(period)])
-            total_vol = sum(volumes)
-            vwap.append(tpv / total_vol if total_vol else ohlcv[i][4])
-    return vwap
-
-# ===== Data Fetching =====
-
-def get_bybit_history_chunked(total_bars=576, interval="5"):
-    url = "https://api.bybit.com/v5/market/kline"
-    headers = {"User-Agent": "SpiralBot/1.0"}
-    max_limit = 200
-    start_ms, end_ms = _two_days_range_ms()
-
-    out = []
-    cursor = start_ms
-    while cursor < end_ms and len(out) < total_bars:
-        params = {
-            "category": "linear",
-            "symbol": "BTCUSDT",
-            "interval": interval,
-            "start": cursor,
-            "end": end_ms,
-            "limit": max_limit
-        }
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=10)
-            j = r.json()
-            if r.status_code != 200 or "result" not in j or "list" not in j["result"]:
-                break
-            chunk = j["result"]["list"]
-            if not chunk:
-                break
-            chunk = list(reversed(chunk))
-            out.extend(chunk)
-            last_ts_ms = int(chunk[-1][0])
-            step_ms = 5 * 60 * 1000 if interval == "5" else 60 * 1000
-            cursor = last_ts_ms + step_ms
-            time.sleep(0.2)
-        except Exception:
-            break
-
-    if len(out) > total_bars:
-        out = out[-total_bars:]
-    return out if out else None
-
-def get_mexc_history_chunked(total_bars=576):
-    url = "https://www.mexc.com/open/api/v2/market/kline"
-    headers = {"User-Agent": "SpiralBot/1.0"}
-    max_limit = 500
-    start_ms, end_ms = _two_days_range_ms()
-
-    out = []
-    cursor = start_ms
-    while cursor < end_ms and len(out) < total_bars:
-        params = {
-            "symbol": "BTC_USDT",
-            "interval": "5m",
-            "limit": max_limit,
-            "start_time": cursor,
-            "end_time": end_ms
-        }
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=10)
-            j = r.json()
-            if r.status_code != 200 or "data" not in j or not isinstance(j["data"], list):
-                break
-            chunk = j["data"]
-            if not chunk:
-                break
-            out.extend(chunk)
-            last_ts_ms = int(chunk[-1][0])
-            step_ms = 5 * 60 * 1000
-            cursor = last_ts_ms + step_ms
-            time.sleep(0.2)
-        except Exception:
-            break
-
-    if len(out) > total_bars:
-        out = out[-total_bars:]
-    return out if out else None
-
-def get_history_48h():
-    rows = get_bybit_history_chunked(total_bars=576, interval="5")
-    if rows:
-        return "Bybit", rows
-    rows = get_mexc_history_chunked(total_bars=576)
-    if rows:
-        return "MEXC", rows
-    return None, None
-
-# ===== Trade Log Handling =====
+import datetime
+import time
+import numpy as np
+import pandas as pd
 
 TRADE_LOG_FILE = "trade_logs.json"
 
-def load_trade_logs():
+# -------------------- Helper Functions -------------------- #
+
+def load_trades():
+    """Load trade logs from file."""
     if not os.path.exists(TRADE_LOG_FILE):
-        return []
+        with open(TRADE_LOG_FILE, "w") as f:
+            json.dump([], f)
     with open(TRADE_LOG_FILE, "r") as f:
         try:
             return json.load(f)
         except json.JSONDecodeError:
             return []
 
-def save_trade_log(entry):
-    logs = load_trade_logs()
-    logs.append(entry)
+def save_trades(trades):
+    """Save trade logs to file."""
     with open(TRADE_LOG_FILE, "w") as f:
-        json.dump(logs, f, indent=2)
+        json.dump(trades, f, indent=2)
+
+def log_trade(entry_price, direction, sl, tp, score, outcome=None):
+    """Log a new trade."""
+    trades = load_trades()
+    trade = {
+        "time": datetime.datetime.utcnow().isoformat(),
+        "entry": entry_price,
+        "direction": direction,
+        "sl": sl,
+        "tp": tp,
+        "score": score,
+        "outcome": outcome
+    }
+    trades.append(trade)
+    save_trades(trades)
 
 def get_trade_logs():
-    return load_trade_logs()[-30:]
+    """Return the last 30 trades."""
+    trades = load_trades()
+    return trades[-30:]
 
 def get_results():
-    logs = load_trade_logs()
-    wins = sum(1 for l in logs if l.get("result") == "win")
-    losses = sum(1 for l in logs if l.get("result") == "loss")
-    total = wins + losses
-    return [wins, losses, total, round((wins / total) * 100, 2) if total > 0 else 0]
+    """Return win rate, total trades, avg score, profitability."""
+    trades = load_trades()
+    if not trades:
+        return [0, 0, 0, 0]
+    wins = [t for t in trades if t.get("outcome") == "win"]
+    win_rate = round(len(wins) / len(trades) * 100, 2)
+    avg_score = round(np.mean([t.get("score", 0) for t in trades]), 2)
+    profit = len(wins) * 1 - (len(trades) - len(wins)) * 1
+    return [len(trades), len(wins), win_rate, avg_score]
 
-# ===== Core Scan =====
+# -------------------- Data Fetch -------------------- #
+
+def fetch_bybit_data(interval="5", limit=200):
+    """Fetch historical kline data from Bybit."""
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {"category": "linear", "symbol": "BTCUSDT", "interval": interval, "limit": limit}
+    r = requests.get(url, params=params, timeout=8)
+    data = r.json()
+    if "result" in data and "list" in data["result"]:
+        df = pd.DataFrame(data["result"]["list"], columns=["time","open","high","low","close","volume","turnover"])
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
+        return df
+    return None
+
+def fetch_mexc_data(interval="5m", limit=200):
+    """Fetch historical kline data from MEXC."""
+    url = "https://www.mexc.com/open/api/v2/market/kline"
+    params = {"symbol": "BTC_USDT", "interval": interval, "limit": limit}
+    r = requests.get(url, params=params, timeout=8)
+    data = r.json()
+    if "data" in data:
+        df = pd.DataFrame(data["data"], columns=["time","open","high","low","close","volume"])
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
+        return df
+    return None
+
+def check_data_source():
+    """Quick health check for /check_data."""
+    try:
+        if fetch_bybit_data(limit=2) is not None:
+            return "✅ Connected to BYBIT"
+    except Exception:
+        pass
+    try:
+        if fetch_mexc_data(limit=2) is not None:
+            return "✅ Connected to MEXC"
+    except Exception:
+        pass
+    return "❌ Error: Failed to fetch data"
+
+# -------------------- Strategy Logic -------------------- #
+
+def calculate_vwap(df):
+    """Calculate VWAP."""
+    q = df["close"] * df["volume"]
+    return q.cumsum() / df["volume"].cumsum()
+
+def calculate_ema(df, period):
+    """Calculate EMA."""
+    return df["close"].ewm(span=period, adjust=False).mean()
+
+def detect_engulfing(df):
+    """Detect bullish/bearish engulfing patterns."""
+    engulfing = []
+    for i in range(1, len(df)):
+        prev_body = abs(df["close"][i-1] - df["open"][i-1])
+        curr_body = abs(df["close"][i] - df["open"][i])
+        if df["close"][i] > df["open"][i] and df["open"][i] < df["close"][i-1] and curr_body > prev_body:
+            engulfing.append("bullish")
+        elif df["close"][i] < df["open"][i] and df["open"][i] > df["close"][i-1] and curr_body > prev_body:
+            engulfing.append("bearish")
+        else:
+            engulfing.append(None)
+    engulfing.insert(0, None)
+    return engulfing
+
+def calculate_rsi(df, period=14):
+    """Calculate RSI."""
+    delta = df["close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+# -------------------- Market Scan -------------------- #
 
 def scan_market():
-    return [None, "No signal at the moment."]
+    """Scan for trade setup."""
+    df = fetch_bybit_data()
+    if df is None:
+        df = fetch_mexc_data()
+        if df is None:
+            return None, "❌ No data from both sources"
 
-# ===== Backtest =====
+    df["vwap"] = calculate_vwap(df)
+    df["ema_fast"] = calculate_ema(df, 9)
+    df["ema_slow"] = calculate_ema(df, 21)
+    df["rsi"] = calculate_rsi(df)
+    df["engulfing"] = detect_engulfing(df)
 
-def run_backtest_stream(notify, bars=576):
-    source, data = get_history_48h()
-    if not data:
-        notify("❌ Backtest: unable to fetch history from Bybit or MEXC.")
-        return
+    latest = df.iloc[-1]
+    signal = None
+    score = 0
 
-    def _ohlcv_row(row, source):
-        if source == "Bybit":
-            return int(row[0])//1000, float(row[1]), float(row[2]), float(row[3]), float(row[4])
-        else:
-            return int(row[0])//1000, float(row[1]), float(row[2]), float(row[3]), float(row[4])
+    if latest["ema_fast"] > latest["ema_slow"] and latest["close"] > latest["vwap"] and latest["engulfing"] == "bullish" and latest["rsi"] > 50:
+        signal = "LONG"
+        score = 2.5
+    elif latest["ema_fast"] < latest["ema_slow"] and latest["close"] < latest["vwap"] and latest["engulfing"] == "bearish" and latest["rsi"] < 50:
+        signal = "SHORT"
+        score = 2.5
 
-    ohlcv = [_ohlcv_row(r, source) for r in data]
-    closes = [c[4] for c in ohlcv]
-    vwap = _vwap_series(ohlcv, period=20)
-    ema5 = _ema_series(closes, 5)
-    ema20 = _ema_series(closes, 20)
-    rsi = _rsi_series(closes, 14)
+    if signal:
+        sl = latest["close"] - 300 if signal == "LONG" else latest["close"] + 300
+        tp = latest["close"] + 600 if signal == "LONG" else latest["close"] - 600
+        log_trade(latest["close"], signal, sl, tp, score)
+        return f"🚨 {signal} Signal\nEntry: {latest['close']}\nSL: {sl}\nTP: {tp}\nScore: {score}", None
+    else:
+        return None, "No signal at the moment."
 
-    notify(f"🧪 Backtest started (~48h) on {source} — pacing 5m per candle.")
-    active_trade = None
+# -------------------- Backtest -------------------- #
 
-    for i in range(20, len(ohlcv)):
-        price = closes[i]
-        if not active_trade:
-            if ema5[i] > ema20[i] and rsi[i] < 30:
-                active_trade = {"type": "long", "entry": price, "sl": price - 300, "tp": price + 600}
-                notify(f"📈 Long entry @ {price}")
-            elif ema5[i] < ema20[i] and rsi[i] > 70:
-                active_trade = {"type": "short", "entry": price, "sl": price + 300, "tp": price - 600}
-                notify(f"📉 Short entry @ {price}")
-        else:
-            if active_trade["type"] == "long":
-                if price >= active_trade["tp"]:
-                    notify(f"✅ TP hit @ {price} (+$600)")
-                    save_trade_log({"result": "win"})
-                    active_trade = None
-                elif price <= active_trade["sl"]:
-                    notify(f"❌ SL hit @ {price} (-$300)")
-                    save_trade_log({"result": "loss"})
-                    active_trade = None
-            elif active_trade["type"] == "short":
-                if price <= active_trade["tp"]:
-                    notify(f"✅ TP hit @ {price} (+$600)")
-                    save_trade_log({"result": "win"})
-                    active_trade = None
-                elif price >= active_trade["sl"]:
-                    notify(f"❌ SL hit @ {price} (-$300)")
-                    save_trade_log({"result": "loss"})
-                    active_trade = None
-        time.sleep(0.1)
+def run_backtest_stream(days=2):
+    """Backtest last X days in streaming style."""
+    df = fetch_bybit_data(limit=200)
+    if df is None:
+        df = fetch_mexc_data(limit=200)
+    if df is None:
+        return ["❌ Backtest: unable to fetch history from Bybit or MEXC."]
+
+    df["vwap"] = calculate_vwap(df)
+    df["ema_fast"] = calculate_ema(df, 9)
+    df["ema_slow"] = calculate_ema(df, 21)
+    df["rsi"] = calculate_rsi(df)
+    df["engulfing"] = detect_engulfing(df)
+
+    results = []
+    for i in range(21, len(df)):
+        latest = df.iloc[i]
+        if latest["ema_fast"] > latest["ema_slow"] and latest["close"] > latest["vwap"] and latest["engulfing"] == "bullish" and latest["rsi"] > 50:
+            results.append(f"{latest['time']}: LONG at {latest['close']}")
+        elif latest["ema_fast"] < latest["ema_slow"] and latest["close"] < latest["vwap"] and latest["engulfing"] == "bearish" and latest["rsi"] < 50:
+            results.append(f"{latest['time']}: SHORT at {latest['close']}")
+    return results

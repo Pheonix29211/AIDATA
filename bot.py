@@ -1,4 +1,5 @@
 import os
+import time
 import logging
 import threading
 from telegram.ext import Updater, CommandHandler
@@ -11,116 +12,136 @@ from utils import (
 )
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("SpiralBot")
 
-# --- Command handlers ---
+# -------------------- Command handlers -------------------- #
 
 def start(update, context):
-    update.message.reply_text("🌀 SpiralBot Activated.\nUse /menu to view commands.")
+    update.message.reply_text("🌀 SpiralBot Online. Use /menu to see commands.")
 
 def menu(update, context):
-    commands = (
+    update.message.reply_text(
         "🌀 SpiralBot Menu:\n"
         "/scan — Manual scan\n"
+        "/forcescan — Instant scan test\n"
         "/logs — Last 30 trades\n"
         "/results — Win stats\n"
         "/status — Current logic\n"
         "/check_data — Verify data source\n"
-        "/backtest — 2-day streamed replay (5m pace)\n"
+        "/backtest — 2-day replay (streamed)\n"
     )
-    update.message.reply_text(commands)
 
 def scan_command(update, context):
-    trade, text = scan_market()
+    # Backward-compatible handling: utils.scan_market() returns (signal_text_or_None, msg_or_None)
+    a, b = scan_market()
+    text = a if a else b if b else "No signal."
     update.message.reply_text(text)
+
+def forcescan_command(update, context):
+    update.message.reply_text("⏱️ Forcing a fresh scan…")
+    a, b = scan_market()
+    text = a if a else b if b else "No signal."
+    update.message.reply_text(f"📡 Force Scan Result:\n{text}")
 
 def logs_command(update, context):
     logs = get_trade_logs()
     if not logs:
         update.message.reply_text("No trades yet.")
         return
-    recent = logs[-30:]
-    formatted = "\n".join([
-        f"{t.get('type','-').upper()} @ {round(t.get('price',0))} | "
-        f"Score: {t.get('score','-')} | Outcome: {t.get('outcome','-')}"
-        for t in reversed(recent)
-    ])
-    update.message.reply_text(f"📊 Last {len(recent)} trades:\n{formatted}")
+    lines = []
+    for t in reversed(logs):
+        lines.append(
+            f"{t.get('time','-')} | {t.get('direction','-')} @ {round(t.get('entry',0))} | "
+            f"SL {round(t.get('sl',0))} TP {round(t.get('tp',0))} | "
+            f"Score {t.get('score','-')} | {t.get('outcome','-')}"
+        )
+    msg = "📊 Last trades:\n" + "\n".join(lines[:30])
+    update.message.reply_text(msg[:4000])
 
 def results_command(update, context):
-    winrate, wins, losses, avg_score = get_results()
+    total, wins, winrate, avg_score = get_results()
     update.message.reply_text(
-        f"📈 Performance Stats:\n"
+        f"📈 Performance Stats\n"
+        f"Total trades: {total}\n"
         f"Wins: {wins}\n"
-        f"Losses: {losses}\n"
-        f"Win Rate: {winrate}%\n"
-        f"Avg Score: {avg_score}"
+        f"Win rate: {winrate}%\n"
+        f"Avg score: {avg_score}"
     )
 
 def status_command(update, context):
     update.message.reply_text(
         "📊 Current Logic:\n"
-        "- BTCUSDT on Bybit (fallback: MEXC)\n"
-        "- VWAP/EMA cross (1m & 5m)\n"
-        "- RSI + Engulfing pattern\n"
+        "- BTCUSDT (Bybit primary, MEXC fallback)\n"
+        "- VWAP + EMA (1m/5m), RSI, Engulfing\n"
         "- $300 SL, $600–$1500 TP\n"
-        "- Momentum pings every 1m\n"
-        "- No duplicate trades\n"
-        "- Learning log enabled"
+        "- Learning log enabled\n"
     )
 
-def check_data(update, context):
-    source = check_data_source()
-    update.message.reply_text(source)
+def check_data_command(update, context):
+    update.message.reply_text(check_data_source())
 
 def backtest_command(update, context):
     chat_id = update.effective_chat.id
-    update.message.reply_text(
-        "🧪 Starting 2-day backtest at real-time pace (5m per candle)…\n"
-        "You’ll receive entries and TP/SL notifications as they ‘replay’."
-    )
+    update.message.reply_text("🧪 Starting 2-day backtest… streaming entries & outcomes.")
+
     def _runner():
-        run_backtest_stream(
-            notify=lambda msg: context.bot.send_message(chat_id=chat_id, text=msg),
-            bars=576,  # ~48h (5m candles)
-        )
+        # utils.run_backtest_stream currently returns a list of lines OR streams internally.
+        try:
+            lines = run_backtest_stream(days=2)
+            # If it returned a list, stream them; if it already streamed, lines may be None
+            if isinstance(lines, list) and lines:
+                for line in lines:
+                    try:
+                        context.bot.send_message(chat_id=chat_id, text=line)
+                        time.sleep(1.0)
+                    except Exception as e:
+                        logger.warning(f"send fail: {e}")
+        except Exception as e:
+            context.bot.send_message(chat_id=chat_id, text=f"❌ Backtest error: {e}")
+
     threading.Thread(target=_runner, daemon=True).start()
 
-# --- Main / webhook ---
+# -------------------- Bootstrap (webhook) -------------------- #
 
 def main():
     TOKEN = os.environ.get("TOKEN")
+    HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+    PORT = int(os.environ.get("PORT", "8443"))
+
     if not TOKEN:
-        print("❌ TOKEN not found in environment variables.")
+        print("❌ TOKEN env var missing.")
+        return
+    if not HOSTNAME:
+        print("❌ RENDER_EXTERNAL_HOSTNAME env var missing.")
         return
 
     updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
 
+    # Register commands
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CommandHandler("menu", menu))
     dp.add_handler(CommandHandler("scan", scan_command))
+    dp.add_handler(CommandHandler("forcescan", forcescan_command))
     dp.add_handler(CommandHandler("logs", logs_command))
     dp.add_handler(CommandHandler("results", results_command))
     dp.add_handler(CommandHandler("status", status_command))
-    dp.add_handler(CommandHandler("check_data", check_data))
+    dp.add_handler(CommandHandler("check_data", check_data_command))
     dp.add_handler(CommandHandler("backtest", backtest_command))
 
-    PORT = int(os.environ.get("PORT", 8443))
-    HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-    if not HOSTNAME:
-        print("❌ HOSTNAME missing. Set RENDER_EXTERNAL_HOSTNAME in env vars.")
-        return
-
+    # Webhook
+    webhook_path = TOKEN
+    webhook_url = f"https://{HOSTNAME}/{webhook_path}"
     updater.start_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path=TOKEN,
-        webhook_url=f"https://{HOSTNAME}/{TOKEN}",
+        url_path=webhook_path,
+        webhook_url=webhook_url,
     )
+    print(f"✅ Webhook set: {webhook_url}")
     updater.idle()
 
 if __name__ == "__main__":
