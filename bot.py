@@ -13,25 +13,26 @@ from utils import (
     get_results,
     check_data_source,
     quick_diag,
+    momentum_tick,
 )
 
-# ---------------- Config ----------------
+# ----------------- Config -----------------
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
 
 WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/{TOKEN}"
 PORT = int(os.environ.get("PORT", 10000))
+AUTO_SCAN = os.getenv("AUTO_SCAN", "1") == "1"
 
 bot = Bot(token=TOKEN)
 app = Flask(__name__)
 dispatcher = Dispatcher(bot=bot, update_queue=None, workers=4, use_context=True)
 
-# ------------- Helpers ------------------
-MAX_TG = 3800  # stay under Telegram ~4096 char limit
+MAX_TG = 3800
 
+# ----------------- Helpers -----------------
 def send_text_chunks(chat_id, text):
-    """Split a long message into multiple Telegram messages."""
     if len(text) <= MAX_TG:
         bot.send_message(chat_id, text)
         return
@@ -39,7 +40,6 @@ def send_text_chunks(chat_id, text):
         bot.send_message(chat_id, text[i:i + MAX_TG])
 
 def send_backtest(chat_id, lines):
-    """Send backtest as messages or attach a .txt if too long."""
     msg = "\n".join(lines or [])
     if not msg:
         bot.send_message(chat_id, "(Backtest finished.)")
@@ -51,16 +51,16 @@ def send_backtest(chat_id, lines):
         bio.name = f"backtest_{int(time.time())}.txt"
         bot.send_document(chat_id, bio, caption="📜 Backtest results (full)")
 
-# ------------- Command Handlers ----------
+# ----------------- Commands -----------------
 def start_cmd(update: Update, _: CallbackContext):
     update.message.reply_text(
         "🌀 SpiralBot Online\n\n"
-        "/menu — Show commands\n"
-        "/scan — Manual scan\n"
+        "/menu — Commands\n"
+        "/scan — Manual scan (live)\n"
         "/forcescan — Force scan now\n"
         "/logs — Last 30 trades\n"
         "/results — Win stats\n"
-        "/backtest — Stream 2-day backtest (try `/backtest 3`)\n"
+        "/backtest — 2-day backtest (e.g. /backtest 3)\n"
         "/check_data — Verify data source\n"
         "/diag — Last API responses"
     )
@@ -87,7 +87,7 @@ def logs_cmd(update: Update, _: CallbackContext):
             f"{t.get('time','')} | {t.get('signal','').upper()} | "
             f"Entry {round(t.get('entry',0))} | SL {round(t.get('sl',0))} | "
             f"TP1 {round(t.get('tp1',0))}→TP2 {round(t.get('tp2',0))} | "
-            f"RSI {round(t.get('rsi',0),1)} | src {t.get('source','')}"
+            f"RSI {round(t.get('rsi',0),1)} | Score {t.get('score','?')}/3 | src {t.get('source','')}"
         )
     send_text_chunks(update.effective_chat.id, "🧾 Recent Trades:\n" + "\n".join(lines))
 
@@ -95,12 +95,10 @@ def results_cmd(update: Update, _: CallbackContext):
     total, wins, win_rate, avg_score = get_results()
     bot.send_message(
         update.effective_chat.id,
-        f"📈 Results:\n"
-        f"Trades: {total}\nWins: {wins}\nWin rate: {win_rate}%\nAvg score: {avg_score}"
+        f"📈 Results:\nTrades: {total}\nWins: {wins}\nWin rate: {win_rate}%\nAvg score: {avg_score}"
     )
 
 def backtest_cmd(update: Update, _: CallbackContext):
-    # optional days argument: /backtest 3
     try:
         parts = update.message.text.strip().split()
         days = int(parts[1]) if len(parts) > 1 else 2
@@ -115,7 +113,7 @@ def check_data_cmd(update: Update, _: CallbackContext):
 def diag_cmd(update: Update, _: CallbackContext):
     bot.send_message(update.effective_chat.id, "🔧 Diag:\n" + quick_diag())
 
-# ---------- Register Handlers -----------
+# ----------------- Register -----------------
 dispatcher.add_handler(CommandHandler("start", start_cmd))
 dispatcher.add_handler(CommandHandler("menu", menu_cmd))
 dispatcher.add_handler(CommandHandler("help", menu_cmd))
@@ -127,19 +125,19 @@ dispatcher.add_handler(CommandHandler("backtest", backtest_cmd))
 dispatcher.add_handler(CommandHandler("check_data", check_data_cmd))
 dispatcher.add_handler(CommandHandler("diag", diag_cmd))
 
-# ------------- Auto-scan Thread ----------
+# ----------------- Auto-Scan Loop -----------------
 def auto_scan_loop():
     interval = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
     chat_id = os.getenv("OWNER_CHAT_ID")
     if not chat_id:
         print("⚠️ AUTO_SCAN enabled but OWNER_CHAT_ID not set.")
         return
-
     cooldown = int(os.getenv("ALERT_COOLDOWN_SECONDS", "180"))
     last_sent = 0
 
     while True:
         try:
+            # 1) Live entry scan (15m + 5m authority)
             title, body = scan_market()
             if title and body:
                 now_ts = time.time()
@@ -148,9 +146,18 @@ def auto_scan_loop():
                     last_sent = now_ts
         except Exception as e:
             print("Auto-scan error:", e)
+
+        try:
+            # 2) Momentum pings every loop (1m cadence)
+            m_title, m_body = momentum_tick()
+            if m_title and m_body:
+                bot.send_message(chat_id=chat_id, text=f"{m_title}\n{m_body}")
+        except Exception as e:
+            print("Momentum tick error:", e)
+
         time.sleep(interval)
 
-# -------------- Webhook ------------------
+# ----------------- Webhook -----------------
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
@@ -161,12 +168,9 @@ def webhook():
 def index():
     return "🌀 SpiralBot Running"
 
-# -------------- Main ---------------------
 if __name__ == "__main__":
-    # Start auto-scan if enabled
-    if os.getenv("AUTO_SCAN", "0") == "1":
+    if AUTO_SCAN:
         threading.Thread(target=auto_scan_loop, daemon=True).start()
-
     bot.set_webhook(WEBHOOK_URL)
     print("✅ Webhook set:", WEBHOOK_URL)
     app.run(host="0.0.0.0", port=PORT)
