@@ -8,8 +8,9 @@ from datetime import datetime
 
 TRADE_LOG_FILE = "trade_logs.json"
 
-# ---------------- HTTP hardening ----------------
+# ---------------- HTTP hardening & diag ----------------
 REQUEST_HEADERS = {"User-Agent": "SpiralBot/1.0 (+render)"}
+LAST_FETCH_DEBUG = {"mexc": "", "bybit": ""}
 
 def _safe_json(resp):
     txt = (resp.text or "").strip()
@@ -19,6 +20,11 @@ def _safe_json(resp):
         return resp.json()
     except Exception:
         return None
+
+def quick_diag():
+    m = LAST_FETCH_DEBUG.get("mexc","no call yet")
+    b = LAST_FETCH_DEBUG.get("bybit","no call yet")
+    return f"MEXC: {m}\nBYBIT: {b}"
 
 # ---------------- Trade logs ----------------
 def _ensure_log_file():
@@ -59,21 +65,21 @@ def get_results():
 def fetch_mexc_data(interval="5m", limit=200, retries=2):
     """
     Robust MEXC fetch (no symbol required by caller):
-      1) Open API v3 (BTC_USDT, returns {"data":[...]})
+      1) Open API v3 (BTC_USDT, returns {'data':[...]} )
       2) Official v3 (BTCUSDT, returns array)
       3) Open API v2 (BTC_USDT, uses 'type' e.g., 5min)
-    Returns DataFrame with columns: [time, open, high, low, close, volume] or None.
+    Returns DataFrame [time, open, high, low, close, volume] or None.
     """
     headers = REQUEST_HEADERS
     lim = min(int(limit), 1000)
 
-    # ---- (1) Open API v3 ----
-    # https://www.mexc.com/open/api/v3/market/kline?symbol=BTC_USDT&interval=5m&limit=200
+    # (1) Open API v3
     v3_open_url = "https://www.mexc.com/open/api/v3/market/kline"
     v3_open_params = {"symbol": "BTC_USDT", "interval": interval, "limit": min(lim, 500)}
     for _ in range(retries + 1):
         try:
-            r = requests.get(v3_open_url, params=v3_open_params, headers=headers, timeout=10)
+            r = requests.get(v3_open_url, params=v3_open_params, headers=headers, timeout=10, allow_redirects=True)
+            LAST_FETCH_DEBUG["mexc"] = f"v3-open {r.status_code} | {(r.text or '')[:120].replace(chr(10),' ')}"
             j = _safe_json(r)
             if isinstance(j, dict) and isinstance(j.get("data"), list) and j["data"]:
                 df = pd.DataFrame(j["data"], columns=["time","open","high","low","close","volume","turnover"])
@@ -84,13 +90,13 @@ def fetch_mexc_data(interval="5m", limit=200, retries=2):
             pass
         time.sleep(0.25)
 
-    # ---- (2) Official v3 (array) ----
-    # https://api.mexc.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=200
+    # (2) Official v3
     v3_url = "https://api.mexc.com/api/v3/klines"
     v3_params = {"symbol": "BTCUSDT", "interval": interval, "limit": lim}
     for _ in range(retries + 1):
         try:
-            r = requests.get(v3_url, params=v3_params, headers=headers, timeout=10)
+            r = requests.get(v3_url, params=v3_params, headers=headers, timeout=10, allow_redirects=True)
+            LAST_FETCH_DEBUG["mexc"] = f"v3-official {r.status_code} | {(r.text or '')[:120].replace(chr(10),' ')}"
             arr = _safe_json(r)
             if isinstance(arr, list) and arr:
                 df = pd.DataFrame(arr, columns=[
@@ -99,21 +105,21 @@ def fetch_mexc_data(interval="5m", limit=200, retries=2):
                 ])
                 for col in ("open","high","low","close","volume"):
                     df[col] = df[col].astype(float)
-                df["time"] = df["close_time"]  # unify
+                df["time"] = df["close_time"]
                 return df[["time","open","high","low","close","volume"]]
         except Exception:
             pass
         time.sleep(0.25)
 
-    # ---- (3) Open API v2 (uses 'type' not 'interval') ----
-    # https://www.mexc.com/open/api/v2/market/kline?symbol=BTC_USDT&type=5min&limit=200
+    # (3) Open API v2 (type=5min etc.)
     interval_map = {"1m":"1min","5m":"5min","15m":"15min","30m":"30min","60m":"60min"}
     v2_type = interval_map.get(interval, "5min")
     v2_url = "https://www.mexc.com/open/api/v2/market/kline"
     v2_params = {"symbol": "BTC_USDT", "type": v2_type, "limit": min(lim, 500)}
     for _ in range(retries + 1):
         try:
-            r = requests.get(v2_url, params=v2_params, headers=headers, timeout=10)
+            r = requests.get(v2_url, params=v2_params, headers=headers, timeout=10, allow_redirects=True)
+            LAST_FETCH_DEBUG["mexc"] = f"v2 {r.status_code} | {(r.text or '')[:120].replace(chr(10),' ')}"
             j = _safe_json(r)
             if isinstance(j, dict) and isinstance(j.get("data"), list) and j["data"]:
                 df = pd.DataFrame(j["data"], columns=["time","open","high","low","close","volume"])
@@ -129,14 +135,15 @@ def fetch_mexc_data(interval="5m", limit=200, retries=2):
 def fetch_bybit_data(interval="5", limit=200, retries=2):
     """
     Bybit public klines (linear BTCUSDT).
-    Returns DataFrame with columns: [time, open, high, low, close, volume] or None.
+    Returns DataFrame [time, open, high, low, close, volume] or None.
     """
     url = "https://api.bybit.com/v5/market/kline"
     params = {"category": "linear", "symbol": "BTCUSDT", "interval": interval, "limit": min(int(limit), 200)}
     headers = REQUEST_HEADERS
     for _ in range(retries + 1):
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=10)
+            r = requests.get(url, params=params, headers=headers, timeout=10, allow_redirects=True)
+            LAST_FETCH_DEBUG["bybit"] = f"{r.status_code} | {(r.text or '')[:120].replace(chr(10),' ')}"
             j = _safe_json(r)
             if j and "result" in j and "list" in j["result"] and j["result"]["list"]:
                 df = pd.DataFrame(j["result"]["list"], columns=["time","open","high","low","close","volume","turnover"])
@@ -234,7 +241,8 @@ def scan_market():
         df = fetch_bybit_data()
         source = "BYBIT"
     if df is None or len(df) < 30:
-        return None, "❌ Data Error:\nNo data from MEXC or BYBIT. Try /forcescan again."
+        dbg = quick_diag()
+        return None, f"❌ Data Error:\nNo data from MEXC or BYBIT.\n\nDiag:\n{dbg}\nTry /forcescan again."
 
     df = _compute_indicators(df)
     sig = detect_signal(df)
@@ -243,7 +251,7 @@ def scan_market():
         sl  = price - 300 if sig == "long" else price + 300
         tp1 = price + 600 if sig == "long" else price - 600
         tp2 = price + 1500 if sig == "long" else price - 1500
-        score = 2.5  # placeholder for future learning score
+        score = 2.5  # placeholder
 
         save_trade({
             "time": datetime.utcnow().isoformat(),
