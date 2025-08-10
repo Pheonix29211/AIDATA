@@ -32,8 +32,7 @@ def _save_state():
 _load_state()
 
 def score(features: dict, regime: str):
-    """Simple scorer using regime reward prior + a couple of features.
-       Replace with your real model later; API stays stable."""
+    """Simple scorer using regime reward prior + a couple of features."""
     hist = _model_memory.get(regime, [])
     prior = (sum(hist)/len(hist)) if hist else 0.55
     base = prior + 0.10*features.get("ema_spread", 0.0) + 0.05*features.get("ema_slope", 0.0)
@@ -80,7 +79,7 @@ def compute_reward(*,
         if streak >= 1:
             sl_penalty *= min(1.6, 1.0 + 0.25*streak)
 
-    # Missed TP penalty (exited early but TP2 would’ve hit)
+    # Missed TP penalty
     missed_tp_penalty = 0.0
     if outcome not in ("TP2", "SL") and tp2_hit and trailing_respected:
         missed_tp_penalty = -0.22
@@ -110,4 +109,7 @@ def register_outcome(outcome: str):
             _state["caution_multiplier"] = max(1.0, _state.get("caution_multiplier", 1.0) - 0.05)
             _state["exploration"] = max(0.04, _state.get("exploration", 0.05) - 0.005)
 
-    _save_state()
+    try:
+        json.dump(_state, open(STATE_FILE, "w"))
+    except Exception:
+        pass
