@@ -1,5 +1,5 @@
 # utils.py
-import os, json, time, math, logging
+import os, json, time, logging, math
 from datetime import datetime, timezone
 from typing import Tuple, Optional
 
@@ -7,8 +7,8 @@ import requests
 import pandas as pd
 import numpy as np
 
-# ---------- Config (defaults are safe) ----------
-SYMBOL              = os.getenv("SYMBOL", "BTCUSDT").upper()  # MEXC spot symbol
+# ---------------- Config ----------------
+SYMBOL              = os.getenv("SYMBOL", "BTCUSDT").upper()   # MEXC spot symbol
 TRADES_FILE         = os.getenv("TRADES_FILE", "trade_logs.json")
 
 # Entry filters (Engulfing removed → trend + RSI band only)
@@ -18,22 +18,23 @@ EMA_FAST            = int(os.getenv("EMA_FAST", "9"))
 EMA_SLOW            = int(os.getenv("EMA_SLOW", "21"))
 
 # Risk/TP in USD distance (not points)
-SL_CAP_BASE         = float(os.getenv("SL_CAP_BASE", "300"))   # base SL target
-SL_CAP_MAX          = float(os.getenv("SL_CAP_MAX", "500"))   # max extension AI/logic may allow
-SL_CUSHION_DOLLARS  = float(os.getenv("SL_CUSHION_DOLLARS", "50"))  # wiggle beyond SL if momentum flips back
-TP1_DOLLARS         = float(os.getenv("TP1_DOLLARS", "600"))  # initial TP
-TP2_DOLLARS         = float(os.getenv("TP2_DOLLARS", "1500")) # runner target
+SL_CAP_BASE         = float(os.getenv("SL_CAP_BASE", "300"))
+SL_CAP_MAX          = float(os.getenv("SL_CAP_MAX", "500"))
+SL_CUSHION_DOLLARS  = float(os.getenv("SL_CUSHION_DOLLARS", "50"))
+TP1_DOLLARS         = float(os.getenv("TP1_DOLLARS", "600"))
+TP2_DOLLARS         = float(os.getenv("TP2_DOLLARS", "1500"))
 
-# AI gate (optional score coming from ai_core; if not present we default 0.50)
+# AI gate (optional)
 AI_MIN              = float(os.getenv("AI_MIN", "0.50"))
 
-# Autoscan timing text (bot handles scheduling; we just print)
-SCAN_TF             = os.getenv("SCAN_TF", "5m").lower()  # main decision timeframe
+# Decision timeframe for autoscan
+SCAN_TF             = os.getenv("SCAN_TF", "5m").lower()
 
 # Valid TFs for MEXC v3
 _VALID_TF = {"1m","5m","15m","30m","1h"}
 
-# ---------- Safe JSON helpers ----------
+
+# ------------- Safe JSON helpers -------------
 def _load_json_safe(path: str, default):
     try:
         if not os.path.exists(path):
@@ -57,19 +58,18 @@ def _append_json_line_safe(path: str, obj: dict, max_keep: int = 2000):
     except Exception as e:
         logging.error(f"Failed to write {path}: {e}")
 
-# ---------- Data: MEXC v3 (primary) ----------
+
+# ------------- MEXC v3 data -------------
 def _mexc_klines(symbol: str, tf: str = "5m", limit: int = 500):
     """
-    MEXC v3 klines (public, no key needed)
+    MEXC v3 klines (public)
     GET https://api.mexc.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=500
-    Returns list of lists.
     """
     base = "https://api.mexc.com/api/v3/klines"
     params = {"symbol": symbol, "interval": tf, "limit": int(limit)}
     try:
         r = requests.get(base, params=params, timeout=10)
         status = r.status_code
-        # Some reverse proxies may return HTML; guard JSON parsing
         try:
             payload = r.json()
         except Exception:
@@ -79,13 +79,8 @@ def _mexc_klines(symbol: str, tf: str = "5m", limit: int = 500):
         return 0, str(e)
 
 def _df_from_mexc(payload) -> Optional[pd.DataFrame]:
-    """
-    Convert MEXC kline array payload → DataFrame with OHLCV and tz-aware index.
-    """
     if not isinstance(payload, list) or not payload or not isinstance(payload[0], (list,tuple)):
         return None
-    # MEXC columns:
-    # 0 open time(ms) 1 open 2 high 3 low 4 close 5 volume 6 close time(ms) ...
     arr = np.array(payload, dtype=object)
     ts  = pd.to_datetime(arr[:,0].astype(np.int64), unit="ms", utc=True).tz_convert("Asia/Kolkata")
     df = pd.DataFrame({
@@ -107,15 +102,17 @@ def fetch_mexc(tf: str = "5m", limit: int = 500) -> Optional[pd.DataFrame]:
     status, payload = _mexc_klines(SYMBOL, tf, limit)
     if status == 200:
         df = _df_from_mexc(payload)
-        return df
-    # Optional hourly retry (MEXC sometimes flaky on 1h)
+        if df is not None:
+            return df
+    # Hourly fallback (MEXC sometimes flaky on '1h')
     if tf == "1h":
         status2, payload2 = _mexc_klines(SYMBOL, "60m", limit)
         if status2 == 200:
             return _df_from_mexc(payload2)
     return None
 
-# ---------- Indicators (no Engulfing gating used) ----------
+
+# ------------- Indicators -------------
 def _ema(x: pd.Series, n: int) -> pd.Series:
     return x.ewm(span=n, adjust=False).mean()
 
@@ -130,7 +127,6 @@ def _rsi(x: pd.Series, n: int = 14) -> pd.Series:
     return rsi.fillna(50)
 
 def _vwap(df: pd.DataFrame, win: int = 20) -> pd.Series:
-    # session-agnostic rolling VWAP to keep it simple/cross-exchange
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
     vol = df["volume"].clip(lower=0.0)
     pv = (tp * vol).rolling(win).sum()
@@ -143,22 +139,17 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_slow"] = _ema(df["close"], EMA_SLOW)
     df["rsi"]      = _rsi(df["close"], 14)
     df["vwap"]     = _vwap(df, win=20)
-
-    # regime: simple separation (trend vs range)
     spread = (df["ema_fast"] - df["ema_slow"]).abs() / df["close"].replace(0,np.nan)
     df["regime"] = np.where(spread > 0.0009, "trend", "range")
     return df.dropna()
 
-# ---------- Signal logic (Engulfing removed) ----------
+
+# ------------- Signal building (no Engulfing) -------------
 def _make_signal(df: pd.DataFrame, tf: str = "5m", ai_score: float = 0.50) -> Tuple[str, str]:
-    """
-    Returns (header, detail). If no trade, header explains why.
-    """
     last = df.iloc[-1]
     trend_up = (last["ema_fast"] > last["ema_slow"]) and (last["close"] > last["vwap"])
     trend_dn = (last["ema_fast"] < last["ema_slow"]) and (last["close"] < last["vwap"])
 
-    # Base filters: trend + RSI band (Engulfing removed)
     long_base  = trend_up and (RSI_MIN <= last["rsi"] <= RSI_MAX)
     short_base = trend_dn and (RSI_MIN <= last["rsi"] <= RSI_MAX)
 
@@ -173,7 +164,6 @@ def _make_signal(df: pd.DataFrame, tf: str = "5m", ai_score: float = 0.50) -> Tu
         return (f"ℹ️ No trade | TF {tf} | Regime {regime} | AI {ai_score:.2f}",
                 f"close={last['close']:.2f} rsi={last['rsi']:.1f} vwap={last['vwap']:.2f} emaΔ={(last['ema_fast']-last['ema_slow']):.2f}")
 
-    # Build USD SL/TP ladder
     price = float(last["close"])
     if side == "LONG":
         sl  = price - SL_CAP_BASE
@@ -192,23 +182,18 @@ def _make_signal(df: pd.DataFrame, tf: str = "5m", ai_score: float = 0.50) -> Tu
     )
     return header, detail
 
-# ---------- Public API used by bot ----------
 
+# ------------- Public API for bot.py -------------
 def scan_market(tf: str = None) -> Tuple[str, str]:
-    """
-    Called by /scan and autoscan. Returns (header, detail)
-    """
     tf = (tf or SCAN_TF).lower()
     df = fetch_mexc(tf, limit=500)
     if df is None or len(df) < 50:
         return ("❌ Data Error:\nNo data from MEXC right now.", "fetch_mexc returned None or too few rows")
     df = compute_indicators(df)
 
-    # AI score (optional). If ai_core not present, fall back to 0.50
     ai_score = 0.50
     try:
-        from ai_core import score
-        # lightweight features
+        from ai_core import score  # optional
         last = df.iloc[-1]
         features = {
             "ema_spread": float((last["ema_fast"] - last["ema_slow"]) / last["close"]),
@@ -221,12 +206,7 @@ def scan_market(tf: str = None) -> Tuple[str, str]:
     return _make_signal(df, tf=tf, ai_score=ai_score)
 
 def run_backtest(days: int = 2, tf: str = "5m") -> Tuple[str, str]:
-    """
-    Super-light backtest over last N days worth of bars from MEXC.
-    Counts entries based on current logic (no Engulfing), simulates TP1/TP2/SL in USD space.
-    """
     tf = tf.lower()
-    # rough bar count
     bars_per_day = {"1m": 1440, "5m": 288, "15m": 96, "30m": 48, "1h": 24}.get(tf, 288)
     limit = min(1000, max(300, days * bars_per_day))
     df = fetch_mexc(tf, limit=limit)
@@ -242,7 +222,6 @@ def run_backtest(days: int = 2, tf: str = "5m") -> Tuple[str, str]:
 
         long_ok  = trend_up  and (RSI_MIN <= row["rsi"] <= RSI_MAX)
         short_ok = trend_dn  and (RSI_MIN <= row["rsi"] <= RSI_MAX)
-
         if not (long_ok or short_ok):
             continue
 
@@ -252,7 +231,6 @@ def run_backtest(days: int = 2, tf: str = "5m") -> Tuple[str, str]:
         tp1   = entry + TP1_DOLLARS if side=="LONG" else entry - TP1_DOLLARS
         tp2   = entry + TP2_DOLLARS if side=="LONG" else entry - TP2_DOLLARS
 
-        # walk forward up to 200 bars
         outcome, bars_to_exit = "OPEN", 0
         for j in range(i+1, min(i+200, len(df))):
             hi = float(df["high"].iloc[j])
@@ -278,7 +256,7 @@ def run_backtest(days: int = 2, tf: str = "5m") -> Tuple[str, str]:
         entries.append((side, entry, outcome, bars_to_exit))
 
     if not entries:
-        return ("🧪 Backtest ({}d, {}): 0 entries | Wins 0 | TP2 0 | SL 0".format(days, tf), "(no qualifying entries)")
+        return (f"🧪 Backtest ({days}d, {tf}): 0 entries | Wins 0 | TP2 0 | SL 0", "(no qualifying entries)")
 
     wins  = sum(1 for _,_,o,_ in entries if o in ("TP1","TP2"))
     tp2s  = sum(1 for _,_,o,_ in entries if o == "TP2")
@@ -289,7 +267,8 @@ def run_backtest(days: int = 2, tf: str = "5m") -> Tuple[str, str]:
         detail_lines.append(f"{idx:02d}. {side} @ {entry:.0f} → {out} in {bars} bars")
     return txt, "\n".join(detail_lines)
 
-# ---------- Logging & status ----------
+
+# ------------- Logging & Status -------------
 def record_trade(payload: dict):
     payload = dict(payload)
     payload["ts"] = datetime.now(timezone.utc).isoformat()
@@ -333,7 +312,7 @@ def get_bot_status() -> str:
 def check_data_source() -> str:
     df = fetch_mexc("5m", limit=200)
     if df is None or df.empty:
-        return "❌ TV connection failed: ❌ TradingView connection failed (we use MEXC now)\n❌ MEXC not responding."
+        return "❌ Data source error: MEXC not responding."
     last = df.index[-1]
     return f"✅ Connected to MEXC\nLast 5m bar: {last}"
 
@@ -346,3 +325,63 @@ def diag_data() -> str:
         else:
             out.append(f"{tf}: {len(df)} bars, last={df.index[-1]}")
     return "\n".join(out)
+
+# --- AI status (for /ai or bot import) ---
+def get_ai_status() -> str:
+    """
+    Returns a short, human-readable summary of the AI's current runtime state.
+    Safe if ai_core is missing; falls back to defaults.
+    """
+    exploration = None
+    caution     = None
+    sl_streak   = None
+    last_ts     = None
+
+    # live state
+    try:
+        import ai_core  # optional
+        st = getattr(ai_core, "_state", {}) or {}
+        exploration = st.get("exploration", None)
+        caution     = st.get("caution_multiplier", None)
+        sl_streak   = st.get("sl_streak", None)
+        last_ts     = st.get("last_outcome_ts", None)
+    except Exception:
+        pass
+
+    # persisted file
+    if (exploration is None) or (caution is None) or (sl_streak is None):
+        try:
+            state_file = os.getenv("AI_STATE_FILE", "ai_state.json")
+            if os.path.exists(state_file):
+                st2 = _load_json_safe(state_file, {})
+                exploration = exploration if exploration is not None else st2.get("exploration", 0.05)
+                caution     = caution     if caution     is not None else st2.get("caution_multiplier", 1.0)
+                sl_streak   = sl_streak   if sl_streak   is not None else st2.get("sl_streak", 0)
+                last_ts     = last_ts     if last_ts     is not None else st2.get("last_outcome_ts", 0)
+        except Exception:
+            pass
+
+    try:
+        if last_ts:
+            last_dt = datetime.fromtimestamp(float(last_ts), tz=timezone.utc).astimezone()
+            last_str = last_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+        else:
+            last_str = "—"
+    except Exception:
+        last_str = "—"
+
+    try:
+        exp = f"{float(exploration):.2f}" if exploration is not None else "n/a"
+        cau = f"{float(caution):.2f}"     if caution     is not None else "n/a"
+        sls = f"{int(sl_streak)}"         if sl_streak   is not None else "n/a"
+    except Exception:
+        exp, cau, sls = "n/a", "n/a", "n/a"
+
+    return (
+        "🤖 AI Status\n"
+        f"- exploration: {exp}\n"
+        f"- caution x:   {cau}\n"
+        f"- SL streak:   {sls}\n"
+        f"- last result: {last_str}\n"
+        f"- gate ≥ {AI_MIN:.2f} | RSI {RSI_MIN:.0f}–{RSI_MAX:.0f} | EMA {EMA_FAST}/{EMA_SLOW}\n"
+    )
