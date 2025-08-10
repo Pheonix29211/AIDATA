@@ -50,21 +50,61 @@ _LOCK = threading.Lock()
 
 # ---------- HELPERS ----------
 def _mexc_klines(symbol: str, interval: str, limit: int = 200):
-    """MEXC v3 klines (spot) -> list of arrays"""
+    """
+    MEXC v3 klines (spot). Some regions return 12 columns (Binance-style),
+    others return 8 columns. Parse both and normalize to the columns we need.
+    """
     url = "https://api.mexc.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=10)
+    r = requests.get(url, params=params, timeout=12)
     if r.status_code != 200:
         raise RuntimeError(f"MEXC {interval} {r.status_code} | {url}")
+
     data = r.json()
     if not isinstance(data, list) or not data:
         raise RuntimeError(f"MEXC {interval} returned no list")
-    cols = ["open_time","open","high","low","close","volume","close_time","quote_asset_vol","trades","buy_base","buy_quote","ignore"]
-    df = pd.DataFrame(data, columns=cols)
+
+    # Build a DataFrame from raw rows (variable-length)
+    df_raw = pd.DataFrame(data)
+
+    # 12-col layout: 0..11
+    #  0 open_time(ms),1 open,2 high,3 low,4 close,5 volume,
+    #  6 close_time(ms),7 quote_vol,8 trades,9 buy_base,10 buy_quote,11 ignore
+    # 8-col layout (observed in your region): 0..7
+    #  0 open_time(ms),1 open,2 high,3 low,4 close,5 volume,
+    #  6 close_time(ms),7 quote_vol
+
+    # Map common fields safely (present in both)
+    colmap = {
+        0: "open_time", 1: "open", 2: "high", 3: "low",
+        4: "close", 5: "volume", 6: "close_time", 7: "quote_asset_vol"
+    }
+    # Extra (only if 12 columns exist)
+    extra_map = {8: "trades", 9: "buy_base", 10: "buy_quote", 11: "ignore"}
+
+    # Rename what exists
+    rename_dict = {}
+    for i, name in colmap.items():
+        if i in df_raw.columns:
+            rename_dict[i] = name
+    for i, name in extra_map.items():
+        if i in df_raw.columns:
+            rename_dict[i] = name
+
+    df = df_raw.rename(columns=rename_dict)
+
+    # Keep only the fields we actually use downstream
+    needed = ["open_time", "open", "high", "low", "close", "volume"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"MEXC {interval} unsupported layout (missing {missing}); got {len(df_raw.columns)} columns")
+
+    # Type conversions
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms").dt.tz_localize("UTC").dt.tz_convert(TZ)
-    for c in ["open","high","low","close","volume"]:
+    for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df[["open_time","open","high","low","close","volume"]].dropna()
+
+    df = df[["open_time", "open", "high", "low", "close", "volume"]].dropna()
     df = df.set_index("open_time")
     return df
 
