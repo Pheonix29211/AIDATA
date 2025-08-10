@@ -9,10 +9,21 @@ SYMBOL = os.getenv("SYMBOL", "BTCUSDT").upper()
 PRIMARY_TF = os.getenv("PRIMARY_TF", "5m").lower()          # "5m" default
 MOMENTUM_TF = os.getenv("MOMENTUM_TF", "1m").lower()        # ping on 1m
 FILTER_TF = os.getenv("FILTER_TF", "15m").lower()           # HTF filter
-FIVE_MIN_LIMIT     = int(os.getenv("FIVE_MIN_LIMIT", "700"))   # ~2 days of 5m bars
-FIFTEEN_MIN_LIMIT  = int(os.getenv("FIFTEEN_MIN_LIMIT", "300"))# ~2 days of 15m bars
 AI_THRESHOLD = float(os.getenv("AI_THRESHOLD", "0.52"))     # gate to allow entries
+# ---- History limits (hard-coded) ----
+ONE_MIN_LIMIT      = 500   # used in /diag only
+FIVE_MIN_LIMIT     = 700   # ~2 days of 5m bars
+FIFTEEN_MIN_LIMIT  = 300   # ~2 days of 15m bars
+THIRTY_MIN_LIMIT   = 300   # optional, /diag
+ONE_HOUR_LIMIT     = 300   # optional, /diag
 
+_LIMITS = {
+    "1m":  ONE_MIN_LIMIT,
+    "5m":  FIVE_MIN_LIMIT,
+    "15m": FIFTEEN_MIN_LIMIT,
+    "30m": THIRTY_MIN_LIMIT,
+    "1h":  ONE_HOUR_LIMIT,
+}
 SL_CAP_BASE = float(os.getenv("SL_CAP_BASE", "300"))
 SL_CAP_MAX  = float(os.getenv("SL_CAP_MAX", "500"))
 SL_CUSHION  = float(os.getenv("SL_CUSHION_DOLLARS", "50"))  # extra room if AI wants
@@ -375,15 +386,17 @@ def start_background(bot):
 # ---------- PUBLIC API FOR BOT ----------
 def diag_data():
     lines = []
-    ok = True
-    for tf in ["1m","5m","15m","30m"]:
+    for tf in ["1m", "5m", "15m", "30m", "1h"]:
         try:
-            df = _mexc_klines(SYMBOL, tf, 200)
-            lines.append(f"{tf}: {len(df)} bars, last={df.index[-1]}")
+            df = mexc_fetch(tf, limit=_LIMITS.get(tf, 200))   # <-- important
+            if df is not None and not df.empty:
+                last_ts = str(df.index[-1])
+                lines.append(f"{tf}: {len(df)} bars, last={last_ts}")
+            else:
+                lines.append(f"{tf}: None")
         except Exception as e:
-            ok = False
-            lines.append(f"{tf}: FAIL {str(e)[:120]}")
-    return "📡 MEXC diag\n" + "\n".join(lines), ("OK" if ok else "ERR")
+            lines.append(f"{tf}: error {e}")
+    return "📡 MEXC diag\n" + "\n".join(lines)
 
 def get_bot_status():
     with _LOCK:
@@ -419,8 +432,8 @@ def get_trade_logs(limit=30):
 def run_backtest(days=2):
     # 5m bars for last N days
     lim = int((days*24*60)/5) + 10
-    d5 = _mexc_klines(SYMBOL, "5m", limit=min(1500, max(200, lim)))
-    d15 = _mexc_klines(SYMBOL, "15m", 400)
+   df5  = mexc_fetch("5m",  limit=FIVE_MIN_LIMIT)     # was 200 or missing
+df15 = mexc_fetch("15m", limit=FIFTEEN_MIN_LIMIT)  # was 200 or missing
     d5i = compute_indicators(d5)
     d15i = compute_indicators(d15)
 
