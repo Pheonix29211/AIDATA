@@ -1,34 +1,50 @@
-# utils.py — data (MEXC), indicators, AI gate, risk/TP/SL, learning, scan API
-import os, time, json, math, requests
+# utils.py — MEXC-only data, indicators, AI gate, risk/TP/SL, learning, scan API
+import os, time, json, math, re, requests
 import pandas as pd
 from datetime import datetime, timezone
 from pathlib import Path
 from ai_core import score as ai_score, online_update, log_candle_stats
 
+# ===== robust env parsing (tolerate commas/text) =====
+def env_float(name, default):
+    raw = os.getenv(name, str(default))
+    try:
+        return float(raw)
+    except:
+        m = re.search(r'-?\d+(\.\d+)?', raw or "")
+        return float(m.group(0)) if m else float(default)
+
+def env_int(name, default):
+    raw = os.getenv(name, str(default))
+    try:
+        return int(raw)
+    except:
+        m = re.search(r'-?\d+', raw or "")
+        return int(m.group(0)) if m else int(default)
+
 # ==== CONFIG ====
-SYMBOL = os.getenv("SYMBOL","BTCUSDT")
-
 AI_ENABLE = os.getenv("AI_ENABLE","true").lower()=="true"
-AI_SCORE_MIN = float(os.getenv("AI_SCORE_MIN","0.65"))
+AI_SCORE_MIN = env_float("AI_SCORE_MIN", 0.65)
 TF_LIST = [t.strip() for t in os.getenv("TF_LIST","5m,15m,30m,45m,1h").split(",")]
-AI_TF_SWITCH_EDGE = float(os.getenv("AI_TF_SWITCH_EDGE","0.05"))
+AI_TF_SWITCH_EDGE = env_float("AI_TF_SWITCH_EDGE", 0.05)
 
-SL_CAP_BASE = float(os.getenv("SL_CAP_BASE","300"))
-SL_CAP_MAX  = float(os.getenv("SL_CAP_MAX","500"))
+SL_CAP_BASE = env_float("SL_CAP_BASE", 300)
+SL_CAP_MAX  = env_float("SL_CAP_MAX", 500)
+SL_CUSHION  = env_float("SL_CUSHION_DOLLARS", 50)
 AI_ALLOW_SL_EXPAND = os.getenv("AI_ALLOW_SL_EXPAND","true").lower()=="true"
-AI_BONUS_EXPAND = float(os.getenv("AI_SCORE_BONUS_FOR_SL_EXPAND","0.10"))
-TP1_MIN = float(os.getenv("TP1_MIN","300"))
+AI_BONUS_EXPAND = env_float("AI_SCORE_BONUS_FOR_SL_EXPAND", 0.10)
+TP1_MIN = env_float("TP1_MIN", 300)
 
 FOCUS_ENABLE = os.getenv("FOCUS_ENABLE","true").lower()=="true"
-FOCUS_SCORE_BUMP = float(os.getenv("FOCUS_SCORE_BUMP","0.20"))
-FOCUS_MINUTES = int(os.getenv("FOCUS_MINUTES","30"))
-FOCUS_COOL_OFF_MIN = int(os.getenv("FOCUS_COOL_OFF_MIN","15"))
+FOCUS_SCORE_BUMP = env_float("FOCUS_SCORE_BUMP", 0.20)
+FOCUS_MINUTES = env_int("FOCUS_MINUTES", 30)
+FOCUS_COOL_OFF_MIN = env_int("FOCUS_COOL_OFF_MIN", 15)
 
-DAILY_STOP_TRADES = int(os.getenv("DAILY_STOP_TRADES","3"))
-DAILY_STOP_DOLLARS = float(os.getenv("DAILY_STOP_DOLLARS","900"))
+DAILY_STOP_TRADES = env_int("DAILY_STOP_TRADES", 3)
+DAILY_STOP_DOLLARS = env_float("DAILY_STOP_DOLLARS", 900)
 
-COUNTERFACT_LOOKAHEAD = int(os.getenv("COUNTERFACT_LOOKAHEAD","10"))
-COUNTERFACT_LAMBDA = float(os.getenv("COUNTERFACT_LAMBDA","0.6"))
+COUNTERFACT_LOOKAHEAD = env_int("COUNTERFACT_LOOKAHEAD", 10)
+COUNTERFACT_LAMBDA = env_float("COUNTERFACT_LAMBDA", 0.6)
 
 DRY_RUN = os.getenv("DRY_RUN","false").lower()=="true"
 
@@ -37,10 +53,10 @@ TRADE_LOG_F = Path("trade_logs.json")
 if not TRADE_LOG_F.exists(): TRADE_LOG_F.write_text("[]")
 
 active_trade = None
-last_tf = None
 focus_until_ts = 0
 losses_today = 0
 loss_dollars_today = 0.0
+_last_tf = None
 last_reset_day = None
 
 # ==== HELPERS ====
@@ -60,30 +76,42 @@ def _session_from_hour(h):
     if 16 <= h < 20:  return "ny"
     return "late"
 
-def _mexc_interval(tf):
-    mapping = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m","45m":"1h","1h":"1h"}
-    return mapping.get(tf,"5m")
+# ===== MEXC (Spiral-style, fixed BTCUSDT) =====
+MEXC_SYMBOL = "BTCUSDT"
+_MEXC_TF_MAP = {
+    "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m","45m":"1h","1h":"1h"
+}
+def _mexc_interval(tf: str) -> str: return _MEXC_TF_MAP.get(tf,"5m")
 
-# ==== DATA ====
 def fetch_mexc(tf="5m", limit=500):
-    """Public MEXC v3 spot klines."""
     url = "https://api.mexc.com/api/v3/klines"
-    params = {"symbol": SYMBOL, "interval": _mexc_interval(tf), "limit": limit}
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code != 200:
-            return None
-        raw = r.json()
-        if not isinstance(raw, list) or len(raw)==0:
-            return None
-        cols = ["open_time","open","high","low","close","volume","close_time","qa","tbv","tq","ig1","ig2"]
-        df = pd.DataFrame(raw, columns=cols[:6])
-        for c in ["open","high","low","close","volume"]: df[c] = df[c].astype(float)
-        df["ts"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-        df.set_index("ts", inplace=True)
-        return df[["open","high","low","close","volume"]]
-    except Exception:
-        return None
+    params = {"symbol": MEXC_SYMBOL, "interval": _mexc_interval(tf), "limit": int(limit)}
+    headers = {"User-Agent":"Mozilla/5.0 (SpiralBot)","Accept":"application/json"}
+    for _ in range(3):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=10)
+            if r.status_code != 200:
+                time.sleep(0.6); continue
+            try:
+                raw = r.json()
+            except Exception:
+                time.sleep(0.6); continue
+            if not isinstance(raw, list) or len(raw)==0:
+                time.sleep(0.4); continue
+            cols = ["open_time","open","high","low","close","volume",
+                    "close_time","qa","tbv","tq","ig1","ig2"]
+            df = pd.DataFrame(raw, columns=cols[:6])
+            for c in ["open","high","low","close","volume"]: df[c]=df[c].astype(float)
+            df["ts"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+            df.set_index("ts", inplace=True)
+            return df[["open","high","low","close","volume"]]
+        except Exception:
+            time.sleep(0.6)
+    return None
+
+def check_data_source():
+    df = fetch_mexc("5m", limit=50)
+    return "✅ MEXC OK" if (df is not None and len(df)>0) else "❌ MEXC FAIL"
 
 # ==== INDICATORS ====
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
@@ -156,19 +184,17 @@ def build_features(z, session):
         "wick_ratio": float(z["wick_ratio"]/3.0),
         "dist_to_swing": float(z["dist_to_swing"]),
         "ema_flip_count": float(z["ema_flip_count"]/10.0),
-        "session_asia": 1.0 if session=="asia" else 0.0,
-        "session_london":1.0 if session=="london" else 0.0,
-        "session_ny":    1.0 if session=="ny" else 0.0,
-        "session_overlap":1.0 if session=="overlap" else 0.0,
+        "session_asia": 1.0 if 0<=h<7 else 0.0,
+        "session_london":1.0 if 7<=h<12 else 0.0,
+        "session_ny":    1.0 if 16<=h<20 else 0.0,
+        "session_overlap":1.0 if 12<=h<16 else 0.0,
         "hour_sin": hs, "hour_cos": hc, "dow_sin": ds, "dow_cos": dc
     }
 
 # ==== TF chooser (hysteresis) ====
-_last_tf = None
 def choose_tf():
     global _last_tf
-    h = _now_utc().hour
-    session = _session_from_hour(h)
+    session = _session_from_hour(_now_utc().hour)
     best = None; best_p = -9; best_row = None
     for tf in TF_LIST:
         df = fetch_mexc(tf, limit=220)
@@ -202,15 +228,14 @@ def plan_risk(z, regime, feats, ai_p):
     short_ok= z["ema9"]<z["ema21"] and z["close"]<z["vwap"] and z["rsi"]<50
 
     p_thresh = AI_SCORE_MIN
-    if os.getenv("FOCUS_ENABLE","true").lower()=="true" and focus_until_ts > time.time():
+    if FOCUS_ENABLE and time.time() < focus_until_ts:
         p_thresh += FOCUS_SCORE_BUMP
 
     direction = "long" if long_ok and ai_p>=p_thresh else ("short" if short_ok and ai_p>=p_thresh else None)
     if direction is None: return None
 
     swing = float(z["swing_low"] if direction=="long" else z["swing_high"])
-    cushion = float(os.getenv("SL_CUSHION_DOLLARS","50"))
-    sl_struct = (swing - cushion) if direction=="long" else (swing + cushion)
+    sl_struct = (swing - SL_CUSHION) if direction=="long" else (swing + SL_CUSHION)
     sl_dist_d = abs(price - sl_struct)
 
     allow_expand = (AI_ALLOW_SL_EXPAND and ai_p >= (AI_SCORE_MIN + AI_BONUS_EXPAND)
@@ -241,7 +266,7 @@ def learn_from_candle(df, z, regime, feats):
         base = float(df["close"].iloc[-1])
         mfe_up = max(0.0, float(fwd.max())-base)
         mae_up = max(0.0, base - float(fwd.min()))
-        reward = max(mfe_up - COUNTERFACT_LAMBDA*mae_up, 0.0)
+        reward = max(mfe_up - COUNTERFACT_LOOKAHEAD*COUNTERFACT_LAMBDA, 0.0)
         label = max(0.0, min(1.0, reward/1000.0))
         online_update(feats, regime, label)
         session = "asia"
@@ -254,6 +279,7 @@ def learn_from_candle(df, z, regime, feats):
 
 # ==== PUBLIC API ====
 def scan_market():
+    global losses_today, loss_dollars_today
     reset_if_new_day()
     if losses_today>=DAILY_STOP_TRADES or loss_dollars_today<=-DAILY_STOP_DOLLARS:
         return "🛑 Daily stop reached. No new trades.", None
@@ -301,7 +327,7 @@ def get_trade_logs(n=30):
 
 def get_bot_status():
     return ("📊 Current Logic:\n"
-            f"- Symbol: {SYMBOL} (MEXC)\n"
+            f"- Symbol: BTCUSDT (MEXC)\n"
             f"- AI: {'ON' if AI_ENABLE else 'OFF'} | Score min {AI_SCORE_MIN}\n"
             f"- TFs: {', '.join(TF_LIST)} | Switch edge {AI_TF_SWITCH_EDGE}\n"
             f"- Risk: SL ${SL_CAP_BASE} (max {SL_CAP_MAX} if HTF reversal), TP1≥${TP1_MIN}\n"
@@ -316,7 +342,3 @@ def get_results():
     losses = sum(1 for x in logs if x.get("pnl",0)<=0)
     net = float(sum(x.get("pnl",0) for x in logs))
     return (len(logs), wins, losses, net)
-
-def check_data_source():
-    df = fetch_mexc("5m", limit=10)
-    return "✅ MEXC OK" if df is not None and len(df)>0 else "❌ MEXC FAIL"

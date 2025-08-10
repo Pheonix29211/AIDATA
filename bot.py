@@ -35,7 +35,6 @@ def scan_cmd(update: Update, ctx: CallbackContext):
         threading.Thread(target=_momentum_loop, args=(active_trade.copy(),), daemon=True).start()
 
 def forcescan_cmd(update: Update, ctx: CallbackContext):
-    # bypass one-trade lock to just produce a signal text (no thread)
     txt, sig = scan_market()
     update.message.reply_text("📡 Force Scan Result:\n" + txt)
 
@@ -167,5 +166,8 @@ def idx():
     return "🌀 SpiralAI running"
 
 if __name__ == "__main__":
-    bot.set_webhook(f"https://{HOST}/{TOKEN}")
+    host = os.getenv("RENDER_EXTERNAL_HOSTNAME", "localhost")
+    url  = f"https://{host}/{TOKEN}"
+    bot.set_webhook(url)
+    print("✅ Webhook set:", url)
     app.run(host="0.0.0.0", port=PORT)
