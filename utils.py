@@ -1,364 +1,375 @@
-# utils.py — MEXC-only data (old working style), indicators, AI gate, risk/TP/SL, learning, scan API
-import os, time, json, math, re, requests
+# utils.py — MEXC data + AI gate + auto management + momentum pings
+import os, json, time, random, requests
 import pandas as pd
-from datetime import datetime, timezone
-from pathlib import Path
-from ai_core import score as ai_score, online_update, log_candle_stats
+import numpy as np
+from datetime import datetime
+from ai_core import score as ai_score, online_update, compute_reward, register_outcome
 
-# ===== robust env parsing (tolerate commas/text) =====
-def env_float(name, default):
-    raw = os.getenv(name, str(default))
-    try:
-        return float(raw)
-    except:
-        m = re.search(r'-?\d+(\.\d+)?', raw or "")
-        return float(m.group(0)) if m else float(default)
-
-def env_int(name, default):
-    raw = os.getenv(name, str(default))
-    try:
-        return int(raw)
-    except:
-        m = re.search(r'-?\d+', raw or "")
-        return int(m.group(0)) if m else int(default)
-
-# ==== CONFIG ====
-AI_ENABLE = os.getenv("AI_ENABLE","true").lower()=="true"
-AI_SCORE_MIN = env_float("AI_SCORE_MIN", 0.65)
-TF_LIST = [t.strip() for t in os.getenv("TF_LIST","5m,15m,30m,1h").split(",")]
-AI_TF_SWITCH_EDGE = env_float("AI_TF_SWITCH_EDGE", 0.05)
-
-SL_CAP_BASE = env_float("SL_CAP_BASE", 300)
-SL_CAP_MAX  = env_float("SL_CAP_MAX", 500)
-SL_CUSHION  = env_float("SL_CUSHION_DOLLARS", 50)
+# ---------- ENV ----------
+SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
+TF_LIST = [tf.strip() for tf in os.getenv("TF_LIST", "1m,5m,15m,30m").split(",")]
+AI_ENABLE = os.getenv("AI_ENABLE", "true").lower() == "true"
+AI_SCORE_MIN = float(os.getenv("AI_SCORE_MIN", "0.50"))
+SL_CAP_BASE = float(os.getenv("SL_CAP_BASE", "300"))     # base $300
+SL_CAP_MAX  = float(os.getenv("SL_CAP_MAX", "400"))      # expand up to $400
 AI_ALLOW_SL_EXPAND = os.getenv("AI_ALLOW_SL_EXPAND","true").lower()=="true"
-AI_BONUS_EXPAND = env_float("AI_SCORE_BONUS_FOR_SL_EXPAND", 0.10)
-TP1_MIN = env_float("TP1_MIN", 300)
 
-FOCUS_ENABLE = os.getenv("FOCUS_ENABLE","true").lower()=="true"
-FOCUS_SCORE_BUMP = env_float("FOCUS_SCORE_BUMP", 0.20)
-FOCUS_MINUTES = env_int("FOCUS_MINUTES", 30)
-FOCUS_COOL_OFF_MIN = env_int("FOCUS_COOL_OFF_MIN", 15)
+AUTO_BE     = os.getenv("AUTO_BE", "true").lower()=="true"
+AUTO_TRAIL  = os.getenv("AUTO_TRAIL", "true").lower()=="true"
+AUTO_EXIT   = os.getenv("AUTO_EXIT", "true").lower()=="true"
 
-DAILY_STOP_TRADES = env_int("DAILY_STOP_TRADES", 3)
-DAILY_STOP_DOLLARS = env_float("DAILY_STOP_DOLLARS", 900)
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")  # string
+TRADE_LOG = os.getenv("TRADE_LOG", "trade_logs.json")
+AI_STATE_FILE = os.getenv("AI_STATE_FILE", "ai_state.json")
 
-COUNTERFACT_LOOKAHEAD = env_int("COUNTERFACT_LOOKAHEAD", 10)
-COUNTERFACT_LAMBDA = env_float("COUNTERFACT_LAMBDA", 0.6)
+# ---------- FILE GUARDS ----------
+def _ensure_json_file(path: str):
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write("[]")
 
-DRY_RUN = os.getenv("DRY_RUN","false").lower()=="true"
+_ensure_json_file(TRADE_LOG)
+_ensure_json_file(AI_STATE_FILE)
 
-# ==== STATE FILES ====
-TRADE_LOG_F = Path("trade_logs.json")
-if not TRADE_LOG_F.exists(): TRADE_LOG_F.write_text("[]")
-
-active_trade = None
-focus_until_ts = 0
-losses_today = 0
-loss_dollars_today = 0.0
-_last_tf = None
-last_reset_day = None
-
-# ===== time helpers =====
-def _now_utc(): return datetime.now(timezone.utc)
-def _day_key(dt): return dt.strftime("%Y-%m-%d")
-
-def reset_if_new_day():
-    global losses_today, loss_dollars_today, last_reset_day
-    d = _day_key(_now_utc())
-    if last_reset_day != d:
-        losses_today = 0; loss_dollars_today = 0.0; last_reset_day = d
-
-def _session_from_hour(h):
-    if 0 <= h < 7:    return "asia"
-    if 7 <= h < 12:   return "london"
-    if 12 <= h < 16:  return "overlap"
-    if 16 <= h < 20:  return "ny"
-    return "late"
-
-# ===== MEXC (EXACT like your old working bot; BTCUSDT spot) =====
-MEXC_SYMBOL = "BTCUSDT"
-
-_MEXC_TF_MAP = {
-    "1m": "1m",
-    "3m": "3m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "45m": "1h",   # if asked 45m, old bot mapped to 1h
-    "1h": "1h",
+# ---------- OPEN-TRADE STATE (for momentum pings + auto mgmt) ----------
+CURRENT_TRADE = {
+    "active": False,
+    "side": None,         # "long" / "short"
+    "entry": None,
+    "sl": None,           # planned SL
+    "sl_virtual": None,   # auto-managed virtual SL
+    "tp1": None,
+    "tp2": None,
+    "tf": None,
+    "opened_at": None,
+    "expanded_sl": False,
+    "bars_held": 0,
+    "moved_be": False,
 }
-def _mexc_interval(tf: str) -> str:
-    return _MEXC_TF_MAP.get(tf, "5m")
 
-def fetch_mexc(tf: str = "5m", limit: int = 1000):
-    """
-    MEXC v3 klines — same behavior as your old Spiral bot.
-    Returns a DataFrame with index=UTC ts and columns: open, high, low, close, volume.
-    """
-    url = "https://api.mexc.com/api/v3/klines"
-    params = {
-        "symbol": MEXC_SYMBOL,
-        "interval": _mexc_interval(tf),
-        "limit": int(limit)
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (SpiralBot)",
-        "Accept": "application/json"
-    }
+def set_open_trade(plan: dict, tf: str, ts: str):
+    CURRENT_TRADE.update({
+        "active": True,
+        "side": plan["direction"],
+        "entry": float(plan["entry"]),
+        "sl": float(plan["sl"]),
+        "sl_virtual": float(plan["sl"]),
+        "tp1": float(plan["tp1"]),
+        "tp2": float(plan["tp2"]),
+        "tf": tf,
+        "opened_at": str(ts),
+        "expanded_sl": bool(plan.get("expanded_sl", False)),
+        "bars_held": 0,
+        "moved_be": False,
+    })
 
-    for _ in range(4):
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=12)
-            if r.status_code != 200:
-                time.sleep(0.6); continue
-            data = r.json()
-            if not isinstance(data, list) or len(data) < 5:
-                time.sleep(0.5); continue
+def clear_open_trade():
+    CURRENT_TRADE.update({
+        "active": False, "side": None, "entry": None, "sl": None, "sl_virtual": None,
+        "tp1": None, "tp2": None, "tf": None, "opened_at": None, "expanded_sl": False,
+        "bars_held": 0, "moved_be": False,
+    })
 
-            # MEXC array: [ open_time, open, high, low, close, volume, close_time, ... ]
-            cols = ["open_time","open","high","low","close","volume"]
-            kl = [row[:6] for row in data]
-            df = pd.DataFrame(kl, columns=cols)
-            for c in ["open","high","low","close","volume"]: df[c]=df[c].astype(float)
-            df["ts"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-            df.set_index("ts", inplace=True)
-            return df[["open","high","low","close","volume"]]
-        except Exception:
-            time.sleep(0.6)
-    return None
-
-def check_data_source():
-    df = fetch_mexc("5m", limit=200)
-    return "✅ MEXC OK" if (df is not None and len(df)>0) else "❌ MEXC FAIL"
-
-# ==== INDICATORS ====
-def ema(s, n): return s.ewm(span=n, adjust=False).mean()
-
-def rsi(series, n=14):
-    delta = series.diff()
-    up = (delta.clip(lower=0)).ewm(alpha=1/n, adjust=False).mean()
-    down = (-delta.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
-    rs = up/(down+1e-12)
-    return 100 - (100/(1+rs))
-
-def atr(df, n=14):
-    tr = pd.concat([
-        (df["high"]-df["low"]),
-        (df["high"]-df["close"].shift()).abs(),
-        (df["low"]-df["close"].shift()).abs()
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/n, adjust=False).mean()
-
-def vwap(df, n=50):
-    tp = (df["high"]+df["low"]+df["close"])/3.0
-    pv = (tp*df["volume"]).rolling(n).sum()
-    vv = df["volume"].rolling(n).sum()
-    return pv/(vv+1e-9)
-
-def compute_indicators(df):
-    df = df.copy()
-    df["ema9"]  = ema(df["close"], 9)
-    df["ema21"] = ema(df["close"],21)
-    df["ema_slope"]   = (df["ema9"]-df["ema9"].shift(3)) / (abs(df["ema9"].shift(3))+1e-9)
-    df["ema_spread"]  = (df["ema9"]-df["ema21"]) / (abs(df["close"])+1e-9)
-    df["rsi"] = rsi(df["close"],14)
-    df["rsi_slope"] = df["rsi"] - df["rsi"].shift(3)
-    df["atr"] = atr(df,14)
-    df["atr_pct"] = df["atr"]/(abs(df["close"])+1e-9)
-    df["vwap"] = vwap(df,50)
-    body = (df["close"]-df["open"]).abs()
-    wick = (df["high"]-df["low"]) - body
-    df["wick_ratio"] = (wick/(body+1e-9)).clip(0,5)
-    df["swing_high"] = df["high"].rolling(10).max()
-    df["swing_low"]  = df["low"].rolling(10).min()
-    ds_low = (df["close"]-df["swing_low"]).abs()
-    ds_high = (df["swing_high"]-df["close"]).abs()
-    df["dist_to_swing"] = ds_low.where(ds_low < ds_high, ds_high) / (abs(df["close"])+1e-9)
-    flip = ((df["ema9"]>df["ema21"]) != (df["ema9"].shift()>df["ema21"].shift())).astype(int)
-    df["ema_flip_count"] = flip.rolling(30).sum().fillna(0)
-    return df
-
-def classify_regime(z):
-    if z["atr_pct"] > 0.004: return "spike"
-    if abs(z["ema_spread"]) > 0.002 and abs(z["ema_slope"])>0.0005: return "trend"
-    return "range"
-
-def _sin_cos(val, period):
-    ang = 2*math.pi*(val/period)
-    return math.sin(ang), math.cos(ang)
-
-def build_features(z, session):
-    h = z.name.hour
-    hs, hc = _sin_cos(h, 24)
-    dow = z.name.weekday()
-    ds, dc = _sin_cos(dow, 7)
-    return {
-        "ema_slope": float(z["ema_slope"]),
-        "ema_spread": float(z["ema_spread"]),
-        "vwap_dist": float((z["close"]-z["vwap"])/(abs(z["close"])+1e-9)),
-        "rsi": (float(z["rsi"])-50.0)/50.0,
-        "rsi_slope": float(z["rsi_slope"]/10.0),
-        "atr_pct": float(z["atr_pct"]),
-        "wick_ratio": float(z["wick_ratio"]/3.0),
-        "dist_to_swing": float(z["dist_to_swing"]),
-        "ema_flip_count": float(z["ema_flip_count"]/10.0),
-        "session_asia": 1.0 if 0<=h<7 else 0.0,
-        "session_london":1.0 if 7<=h<12 else 0.0,
-        "session_ny":    1.0 if 16<=h<20 else 0.0,
-        "session_overlap":1.0 if 12<=h<16 else 0.0,
-        "hour_sin": hs, "hour_cos": hc, "dow_sin": ds, "dow_cos": dc
-    }
-
-# ==== TF chooser (hysteresis) — MEXC-only ====
-def choose_tf():
-    global _last_tf
-    session = _session_from_hour(_now_utc().hour)
-    best = None; best_p = -9; best_row = None
-    for tf in TF_LIST:
-        df = fetch_mexc(tf, limit=1000)
-        if df is None or len(df) < 30:   # tolerant
-            continue
-        df = compute_indicators(df)
-        z = df.iloc[-1]
-        regime = classify_regime(z)
-        feats = build_features(z, session)
-        p,_ = ai_score(feats, regime) if AI_ENABLE else (1.0,0.0)
-        if p>best_p:
-            best, best_p, best_row = (tf, p, (df,z,regime,feats,session))
-    if best is None:
-        return None
-    if _last_tf is not None and best != _last_tf:
-        df2 = fetch_mexc(_last_tf, limit=1000)
-        if df2 is not None and len(df2)>=30:
-            df2 = compute_indicators(df2)
-            z2 = df2.iloc[-1]
-            regime2 = classify_regime(z2)
-            feats2 = build_features(z2, session)
-            p2,_ = ai_score(feats2, regime2) if AI_ENABLE else (1.0,0.0)
-            if p2 >= best_p - AI_TF_SWITCH_EDGE:
-                return _last_tf, p2, (df2,z2,regime2,feats2,session), "MEXC"
-    _last_tf = best
-    return best, best_p, best_row, "MEXC"
-
-# ==== Risk / TP / SL planner ====
-def plan_risk(z, regime, feats, ai_p):
-    price = float(z["close"])
-    long_ok = z["ema9"]>z["ema21"] and z["close"]>z["vwap"] and z["rsi"]>50
-    short_ok= z["ema9"]<z["ema21"] and z["close"]<z["vwap"] and z["rsi"]<50
-
-    p_thresh = AI_SCORE_MIN
-    if FOCUS_ENABLE and time.time() < focus_until_ts:
-        p_thresh += FOCUS_SCORE_BUMP
-
-    direction = "long" if long_ok and ai_p>=p_thresh else ("short" if short_ok and ai_p>=p_thresh else None)
-    if direction is None: return None
-
-    swing = float(z["swing_low"] if direction=="long" else z["swing_high"])
-    sl_struct = (swing - SL_CUSHION) if direction=="long" else (swing + SL_CUSHION)
-    sl_dist_d = abs(price - sl_struct)
-
-    allow_expand = (AI_ALLOW_SL_EXPAND and ai_p >= (AI_SCORE_MIN + AI_BONUS_EXPAND)
-                    and abs(float(z["ema_spread"]))>0.002 and abs(float(z["rsi_slope"]))>0.5
-                    and abs(float((z["close"]-z["vwap"])/(abs(z["close"])+1e-9)))>0.001)
-    cap = SL_CAP_MAX if allow_expand else SL_CAP_BASE
-    sl_dollars = min(sl_dist_d, cap)
-
-    atr_val = float(z["atr"])
-    tp1 = max(TP1_MIN, 0.8*atr_val)
-    tp2 = max(tp1*2.0, 1500.0 if regime=="trend" and ai_p>AI_SCORE_MIN+0.15 else tp1*2.2)
-
-    return {
-        "direction": direction,
-        "entry": price,
-        "sl": price - sl_dollars if direction=="long" else price + sl_dollars,
-        "tp1": price + tp1 if direction=="long" else price - tp1,
-        "tp2": price + tp2 if direction=="long" else price - tp2,
-        "ai_allow_expand": allow_expand,
-        "ai_p": ai_p,
-    }
-
-# ==== Candle learning (no-trade bars) ====
-def learn_from_candle(df, z, regime, feats):
+# ---------- LOG ----------
+def _append_log(obj: dict):
     try:
-        fwd = df["close"].iloc[-COUNTERFACT_LOOKAHEAD:]
-        if len(fwd) <= 1: return
-        base = float(df["close"].iloc[-1])
-        mfe_up = max(0.0, float(fwd.max())-base)
-        mae_up = max(0.0, base - float(fwd.min()))
-        reward = max(mfe_up - COUNTERFACT_LOOKAHEAD*COUNTERFACT_LAMBDA, 0.0)
-        label = max(0.0, min(1.0, reward/1000.0))
-        online_update(feats, regime, label)
-        session = "asia"
-        if feats.get("session_london")==1.0: session="london"
-        elif feats.get("session_ny")==1.0: session="ny"
-        elif feats.get("session_overlap")==1.0: session="overlap"
-        log_candle_stats(regime, session, reward)
+        arr = json.load(open(TRADE_LOG, "r"))
     except Exception:
-        pass
+        arr = []
+    arr.append(obj)
+    json.dump(arr, open(TRADE_LOG, "w"))
 
-# ==== PUBLIC API ====
-def scan_market():
-    global losses_today, loss_dollars_today
-    reset_if_new_day()
-    if losses_today>=DAILY_STOP_TRADES or loss_dollars_today<=-DAILY_STOP_DOLLARS:
-        return "🛑 Daily stop reached. No new trades.", None
-
-    pick = choose_tf()
-    if pick is None: 
-        return "ℹ️ No data from MEXC right now.", None
-    tf, ai_p, (df,z,regime,feats,session), src = pick
-
-    planned = plan_risk(z, regime, feats, ai_p)
-    if planned is None:
-        learn_from_candle(df, z, regime, feats)
-        return f"ℹ️ No trade | TF {tf} | Regime {regime} | AI {ai_p:.2f}", None
-
-    direction = planned["direction"]; entry=planned["entry"]
-    sl=planned["sl"]; tp1=planned["tp1"]; tp2=planned["tp2"]
-    exp = " (SL expand)" if planned["ai_allow_expand"] else ""
-    txt = (f"{'🟢 LONG' if direction=='long' else '🔴 SHORT'} @ {entry:.2f} | "
-           f"SL {sl:.2f} TP {tp1:.2f}→{tp2:.2f} [MEXC]\n"
-           f"🧠 AI {ai_p:.2f}{exp} | Regime {regime} | TF {tf}")
-    signal = {"side":direction,"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tf":tf,"regime":regime,"ai":ai_p,"time":datetime.utcnow().isoformat()+"Z"}
-    if DRY_RUN:
-        txt = "📝 DRY RUN\n" + txt
-        return txt, None
-    return txt, signal
-
-def record_trade(trade, outcome_pnl):
-    global losses_today, loss_dollars_today
+def get_trade_logs(limit=30):
     try:
-        logs = json.loads(TRADE_LOG_F.read_text())
+        arr = json.load(open(TRADE_LOG, "r"))
     except Exception:
-        logs = []
-    logs.append({**trade, "pnl": float(outcome_pnl), "closed_at": datetime.utcnow().isoformat()+"Z"})
-    TRADE_LOG_F.write_text(json.dumps(logs, indent=2))
-    if outcome_pnl < 0:
-        losses_today += 1
-        loss_dollars_today += outcome_pnl
-
-def get_trade_logs(n=30):
-    try:
-        logs = json.loads(TRADE_LOG_F.read_text())
-        return logs[-n:]
-    except Exception:
-        return []
-
-def get_bot_status():
-    return ("📊 Current Logic:\n"
-            f"- Symbol: BTCUSDT (MEXC)\n"
-            f"- AI: {'ON' if AI_ENABLE else 'OFF'} | Score min {AI_SCORE_MIN}\n"
-            f"- TFs: {', '.join(TF_LIST)} | Switch edge {AI_TF_SWITCH_EDGE}\n"
-            f"- Risk: SL ${SL_CAP_BASE} (max {SL_CAP_MAX} if HTF reversal), TP1≥${TP1_MIN}\n"
-            f"- Focus: {'ON' if FOCUS_ENABLE else 'OFF'} | Daily stop: "
-            f"{DAILY_STOP_TRADES} trades / ${DAILY_STOP_DOLLARS:.0f}\n"
-            f"- Dry-run: {'ON' if DRY_RUN else 'OFF'}")
+        return "No logs."
+    arr = arr[-limit:]
+    lines = []
+    for x in arr:
+        lines.append(json.dumps(x, ensure_ascii=False))
+    return "\n".join(lines)
 
 def get_results():
-    logs = get_trade_logs(500)
-    if not logs: return (0,0,0,0.0)
-    wins = sum(1 for x in logs if x.get("pnl",0)>0)
-    losses = sum(1 for x in logs if x.get("pnl",0)<=0)
-    net = float(sum(x.get("pnl",0) for x in logs))
-    return (len(logs), wins, losses, net)
+    try:
+        arr = json.load(open(TRADE_LOG, "r"))
+    except Exception:
+        return "No logs."
+    w = sum(1 for x in arr if x.get("outcome") in ("TP1","TP2","EARLY_EXIT"))
+    l = sum(1 for x in arr if x.get("outcome") == "SL")
+    o = sum(1 for x in arr if x.get("event") == "OPEN")
+    return f"W:{w} / L:{l} / OPEN signals:{o}"
+
+def get_bot_status():
+    return (
+        f"📊 Current Logic:\n"
+        f"- {SYMBOL} on MEXC\n"
+        f"- TFs: {', '.join(TF_LIST)}\n"
+        f"- AI gate: {AI_ENABLE} (min {AI_SCORE_MIN:.2f})\n"
+        f"- SL ${SL_CAP_BASE:.0f} (expand to {SL_CAP_MAX:.0f}: {AI_ALLOW_SL_EXPAND})\n"
+        f"- TP1 $600 / TP2 $1500\n"
+        f"- Auto BE:{AUTO_BE} / Trail:{AUTO_TRAIL} / AutoExit:{AUTO_EXIT}\n"
+        f"- Momentum pings: 1m+5m"
+    )
+
+# ---------- DATA ----------
+MEXC_V3 = "https://www.mexc.com/api/v3/klines"   # works like Binance
+
+def _interval_ok(tf: str) -> bool:
+    return tf in ("1m","5m","15m","30m","1h","4h","1d")
+
+def fetch_mexc(tf="5m", limit=500) -> pd.DataFrame | None:
+    if not _interval_ok(tf): return None
+    try:
+        params = {"symbol": SYMBOL, "interval": tf, "limit": min(1000, int(limit))}
+        r = requests.get(MEXC_V3, params=params, timeout=10)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, list) or len(data) == 0:
+            return None
+        cols = ["open_time","open","high","low","close","volume","close_time","qav"]
+        rows = []
+        for k in data:
+            rows.append([k[0], float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]), k[6], float(k[7]) if len(k)>7 else 0.0])
+        df = pd.DataFrame(rows, columns=cols)
+        df["time"] = pd.to_datetime(df["open_time"], unit="ms")
+        df.set_index("time", inplace=True)
+        return df[["open","high","low","close","volume"]].astype(float)
+    except Exception:
+        return None
+
+def diag_data():
+    parts = []
+    for tf in TF_LIST:
+        d = fetch_mexc(tf, limit=200)
+        if d is None:
+            parts.append(f"{tf}: None")
+        else:
+            parts.append(f"{tf}: {len(d)} bars, last={d.index[-1]}")
+    return "📡 MEXC diag\n" + "\n".join(parts)
+
+# ---------- INDICATORS ----------
+def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
+def _rsi(s, n=14):
+    delta = s.diff()
+    up, down = delta.clip(lower=0), -delta.clip(upper=0)
+    rs = (up.rolling(n).mean()) / (down.rolling(n).mean().replace(0, np.nan))
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50)
+
+def _vwap(df, n=96):  # intraday proxy
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    vw = (tp * df["volume"]).rolling(n).sum() / (df["volume"].rolling(n).sum().replace(0, np.nan))
+    return vw.fillna(method="bfill").fillna(df["close"])
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["ema20"] = _ema(out["close"], 20)
+    out["ema50"] = _ema(out["close"], 50)
+    out["rsi"]   = _rsi(out["close"], 14)
+    out["vwap"]  = _vwap(out)
+    # helpers
+    out["ema_spread"] = (out["ema20"] - out["ema50"]) / out["close"]
+    out["ema_slope"]  = out["ema20"].pct_change().rolling(5).mean()
+    # engulfing
+    o,c = out["open"], out["close"]
+    o1,c1 = o.shift(1), c.shift(1)
+    out["bull_engulf"] = (c>o) & (o1>c1) & (c>o1) & (o<c1)
+    out["bear_engulf"] = (c<o) & (o1<c1) & (c<o1) & (o>c1)
+    return out
+
+def _regime(row):
+    if row["ema20"]>row["ema50"] and row["close"]>row["vwap"]: return "trend"
+    if abs(row["ema_spread"])<0.0015 and abs(row["ema_slope"])<0.0003: return "range"
+    return "spike"
+
+# ---------- SIGNAL / PLAN ----------
+def _plan_from_row(row, side: str):
+    entry = float(row["close"])
+    if side == "long":
+        sl = entry - SL_CAP_BASE
+        tp1 = entry + 600
+        tp2 = entry + 1500
+    else:
+        sl = entry + SL_CAP_BASE
+        tp1 = entry - 600
+        tp2 = entry - 1500
+    return {"direction": side, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "expanded_sl": False}
+
+def _maybe_expand_sl(plan: dict, row_now, row_15=None, row_30=None, ai_p=0.0):
+    if not AI_ALLOW_SL_EXPAND: return plan
+    if ai_p < max(0.60, AI_SCORE_MIN + 0.05): return plan
+    if row_15 is None or row_30 is None: return plan
+    # require higher-TF alignment with side
+    side = plan["direction"]
+    ok15 = (row_15["ema20"]>row_15["ema50"] and row_15["close"]>row_15["vwap"]) if side=="long" else (row_15["ema20"]<row_15["ema50"] and row_15["close"]<row_15["vwap"])
+    ok30 = (row_30["ema20"]>row_30["ema50"] and row_30["close"]>row_30["vwap"]) if side=="long" else (row_30["ema20"]<row_30["ema50"] and row_30["close"]<row_30["vwap"])
+    if ok15 and ok30:
+        # expand to SL_CAP_MAX while keeping direction
+        if side=="long":
+            plan["sl"] = plan["entry"] - SL_CAP_MAX
+        else:
+            plan["sl"] = plan["entry"] + SL_CAP_MAX
+        plan["expanded_sl"] = True
+    return plan
+
+def scan_market():
+    """Returns (title, body) or (None, reason). Also sets CURRENT_TRADE for pings."""
+    df5 = fetch_mexc("5m", 300)
+    if df5 is None or len(df5)<80:
+        return (None, "❌ Data Error:\nNo data from MEXC.")
+    r5 = compute_indicators(df5).iloc[-1]
+    regime = _regime(r5)
+
+    # entry side candidates
+    long_ok  = (r5["close"]>r5["vwap"]) and (r5["ema20"]>r5["ema50"]) and (r5["rsi"]<70)
+    short_ok = (r5["close"]<r5["vwap"]) and (r5["ema20"]<r5["ema50"]) and (r5["rsi"]>30)
+
+    if not long_ok and not short_ok:
+        return ("ℹ️ No trade", f"TF 5m | Regime {regime}")
+
+    # AI gate
+    feats = {"ema_spread": float(r5["ema_spread"]), "ema_slope": float(r5["ema_slope"])}
+    ai_p, explore = ai_score(feats, regime) if AI_ENABLE else (1.0, 0.0)
+    if AI_ENABLE and ai_p < AI_SCORE_MIN and random.random() > explore:
+        return ("ℹ️ No trade", f"TF 5m | Regime {regime} | AI {ai_p:.2f}")
+
+    side = "long" if (long_ok and (not short_ok or r5["ema_spread"]>=0)) else "short"
+    plan = _plan_from_row(r5, side)
+
+    # consider SL expansion using 15m + 30m
+    df15 = fetch_mexc("15m", 300)
+    df30 = fetch_mexc("30m", 300)
+    if df15 is not None and df30 is not None and len(df15)>30 and len(df30)>30:
+        r15 = compute_indicators(df15).iloc[-1]
+        r30 = compute_indicators(df30).iloc[-1]
+        plan = _maybe_expand_sl(plan, r5, r15, r30, ai_p)
+
+    # register open idea
+    set_open_trade(plan, "5m", df5.index[-1].isoformat())
+
+    hdr = f"{'🟢 LONG' if side=='long' else '🔴 SHORT'} @ {plan['entry']:.0f} | SL {plan['sl']:.0f} TP {plan['tp1']:.0f}→{plan['tp2']:.0f} [MEXC]"
+    body = f"AI {ai_p:.2f} | Regime {regime} | ExpandedSL {plan['expanded_sl']}"
+    _append_log({"ts": time.time(), "event": "OPEN", "side": side, "entry": plan["entry"], "sl": plan["sl"], "tp1": plan["tp1"], "tp2": plan["tp2"], "ai": ai_p, "regime": regime})
+    return (hdr, body)
+
+# ---------- MOMENTUM PINGS + AUTO MGMT ----------
+def _momo_flags(df_1m: pd.DataFrame, df_5m: pd.DataFrame):
+    r1 = compute_indicators(df_1m).iloc[-1]
+    r5 = compute_indicators(df_5m).iloc[-1]
+    bull1 = (r1["close"]>r1["vwap"]) and (r1["ema20"]>r1["ema50"])
+    bear1 = (r1["close"]<r1["vwap"]) and (r1["ema20"]<r1["ema50"])
+    bull5 = (r5["close"]>r5["vwap"]) and (r5["ema20"]>r5["ema50"])
+    bear5 = (r5["close"]<r5["vwap"]) and (r5["ema20"]<r5["ema50"])
+    return r1, r5, bull1, bear1, bull5, bear5
+
+def _close_trade(reason: str, px: float, outcome: str):
+    # log + reward
+    entry = CURRENT_TRADE["entry"]
+    pnl = (px - entry) if CURRENT_TRADE["side"]=="long" else (entry - px)
+    bars = CURRENT_TRADE["bars_held"]
+    reward = compute_reward(
+        outcome=outcome,
+        pnl=float(pnl),
+        bars_to_exit=int(bars),
+        tp2_hit=(outcome=="TP2"),
+        tp1_hit=(outcome in ("TP1","TP2")),
+        sl_expanded=bool(CURRENT_TRADE.get("expanded_sl", False)),
+        sl_dollars=float(abs(CURRENT_TRADE["sl"] - entry)),
+        sl_cap_base=SL_CAP_BASE,
+        trailing_respected=True,
+        momentum_aligned_bars=max(0, bars),
+        duplicate_entry=False,
+    )
+    online_update({"ema_spread":0.0,"ema_slope":0.0}, "trend", reward)
+    register_outcome(outcome)
+    _append_log({"ts": time.time(), "event":"CLOSE", "reason":reason, "px":px, "pnl":pnl, "outcome":outcome})
+    clear_open_trade()
+    return pnl
+
+def check_momentum_and_message(bot):
+    if not CURRENT_TRADE.get("active"): return
+    try:
+        d1 = fetch_mexc("1m", 200)
+        d5 = fetch_mexc("5m", 200)
+        if d1 is None or d5 is None or len(d1)<50 or len(d5)<50: return
+        r1, r5, bull1, bear1, bull5, bear5 = _momo_flags(d1, d5)
+        last = float(r1["close"])
+        side = CURRENT_TRADE["side"]
+        entry = CURRENT_TRADE["entry"]
+        tp1 = CURRENT_TRADE["tp1"]
+        tp2 = CURRENT_TRADE["tp2"]
+        slv = CURRENT_TRADE["sl_virtual"]
+        CURRENT_TRADE["bars_held"] += 1
+
+        # unrealized
+        upnl = (last - entry) if side=="long" else (entry - last)
+
+        # --- AUTO BE ---
+        if AUTO_BE and (not CURRENT_TRADE["moved_be"]) and upnl >= 200:
+            CURRENT_TRADE["sl_virtual"] = entry
+            CURRENT_TRADE["moved_be"] = True
+            if OWNER_CHAT_ID:
+                bot.send_message(chat_id=OWNER_CHAT_ID, text=f"🔒 BE moved @ {entry:.0f} | uPnL +${upnl:.0f}")
+
+        # --- AUTO TRAIL (VWAP/EMA20 on 1m) ---
+        if AUTO_TRAIL:
+            if side=="long" and bull1 and bull5:
+                trail = max(float(r1["vwap"]), float(r1["ema20"]))
+                CURRENT_TRADE["sl_virtual"] = max(CURRENT_TRADE["sl_virtual"], trail)
+            elif side=="short" and bear1 and bear5:
+                trail = min(float(r1["vwap"]), float(r1["ema20"]))
+                CURRENT_TRADE["sl_virtual"] = min(CURRENT_TRADE["sl_virtual"], trail)
+
+        # --- TP checks (auto exit) ---
+        if side=="long":
+            if last >= tp2:
+                _close_trade("TP2", last, "TP2")
+                if OWNER_CHAT_ID: bot.send_message(chat_id=OWNER_CHAT_ID, text=f"✅ Trade done: TP2 @ {last:.0f}")
+                return
+            if last >= tp1:
+                # ping to hold if momo strong else book TP1
+                if bull1 and bull5:
+                    if OWNER_CHAT_ID: bot.send_message(chat_id=OWNER_CHAT_ID, text=f"🎯 TP1 reached {tp1:.0f} — momentum strong, HOLD for TP2")
+                else:
+                    _close_trade("TP1", last, "TP1")
+                    if OWNER_CHAT_ID: bot.send_message(chat_id=OWNER_CHAT_ID, text=f"✅ Trade done: TP1 @ {last:.0f}")
+                    return
+        else:
+            if last <= tp2:
+                _close_trade("TP2", last, "TP2")
+                if OWNER_CHAT_ID: bot.send_message(chat_id=OWNER_CHAT_ID, text=f"✅ Trade done: TP2 @ {last:.0f}")
+                return
+            if last <= tp1:
+                if bear1 and bear5:
+                    if OWNER_CHAT_ID: bot.send_message(chat_id=OWNER_CHAT_ID, text=f"🎯 TP1 reached {tp1:.0f} — momentum strong, HOLD for TP2")
+                else:
+                    _close_trade("TP1", last, "TP1")
+                    if OWNER_CHAT_ID: bot.send_message(chat_id=OWNER_CHAT_ID, text=f"✅ Trade done: TP1 @ {last:.0f}")
+                    return
+
+        # --- Auto exit on 5m flip (or SL virtual hit) ---
+        flip_against = (side=="long" and bear5) or (side=="short" and bull5)
+        sl_hit = (side=="long" and last <= CURRENT_TRADE["sl_virtual"]) or (side=="short" and last >= CURRENT_TRADE["sl_virtual"])
+        if AUTO_EXIT and (flip_against or sl_hit):
+            reason = "5m flip" if flip_against else "SL/Trail"
+            _close_trade(reason, last, "SL" if sl_hit else "EARLY_EXIT")
+            if OWNER_CHAT_ID:
+                bot.send_message(chat_id=OWNER_CHAT_ID, text=f"🛑 Trade done: {reason} @ {last:.0f}")
+            return
+
+        # --- Ping status if still open ---
+        if OWNER_CHAT_ID:
+            if side=="long":
+                msg = f"🟢 HOLD LONG | 1m:{'↑' if bull1 else 'x'} 5m:{'↑' if bull5 else 'x'} | Px {last:.0f} | uPnL +${upnl:.0f} | vSL {CURRENT_TRADE['sl_virtual']:.0f}"
+            else:
+                msg = f"🔴 HOLD SHORT | 1m:{'↓' if bear1 else 'x'} 5m:{'↓' if bear5 else 'x'} | Px {last:.0f} | uPnL +${upnl:.0f} | vSL {CURRENT_TRADE['sl_virtual']:.0f}"
+            bot.send_message(chat_id=OWNER_CHAT_ID, text=msg)
+
+    except Exception:
+        return
+
+# ---------- PUBLIC HELPERS FOR BOT ----------
+def check_data_source():
+    return diag_data()
