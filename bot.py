@@ -1,136 +1,108 @@
+# bot.py
 import os
 from flask import Flask, request
 from telegram import Bot, Update
 from telegram.ext import Dispatcher, CommandHandler, CallbackContext
-from utils import start_background
-start_background(bot)
+
 from utils import (
-    scan_market, diag_data, run_backtest, get_bot_status,
-    get_results, get_trade_logs, start_background, get_ai_status
+    scan_market,        # returns (header, detail) or (text, None)
+    diag_data,          # returns string
+    run_backtest,       # returns (header, detail)
+    get_bot_status,     # returns string
+    get_results,        # returns string
+    get_trade_logs,     # returns string
+    start_background    # starts auto-scan + momentum pings threads
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
-OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
-HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+OWNER = os.getenv("OWNER_CHAT_ID")
+HOST  = os.getenv("RENDER_EXTERNAL_HOSTNAME", "localhost")
+PORT  = int(os.getenv("PORT", "10000"))
 WEBHOOK_URL = f"https://{HOST}/{TOKEN}"
-PORT = int(os.getenv("PORT", "10000"))
 
-bot = Bot(token=TOKEN)
 app = Flask(__name__)
+bot = Bot(token=TOKEN)
 dispatcher = Dispatcher(bot=bot, update_queue=None, workers=4, use_context=True)
 
-# ------------- helpers -------------
-def _send_long(chat_id, text):
-    # Telegram hard limit ~4096 chars
-    chunk = 3800
-    if len(text) <= chunk:
-        bot.send_message(chat_id=chat_id, text=text)
-    else:
-        for i in range(0, len(text), chunk):
-            bot.send_message(chat_id=chat_id, text=text[i:i+chunk])
+# ---- commands ----
+def start_cmd(update: Update, context: CallbackContext):
+    update.message.reply_text("🌀 SpiralBot Online! Use /menu")
 
-# ------------- commands -------------
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text("🌀 SpiralBot online. Use /menu")
-
-def menu(update: Update, context: CallbackContext):
+def menu_cmd(update: Update, context: CallbackContext):
     update.message.reply_text(
-        "🌀 Menu:\n"
+        "🌀 SpiralBot Menu:\n"
         "/scan — Manual scan\n"
-        "/forcescan — Force data + scan now\n"
-        "/diag — Data source diagnostics\n"
-        "/status — Current logic + open trade\n"
-        "/results — Win/SL summary\n"
-        "/logs — Last 30 trade events\n"
-        "/backtest — 2-day 5m backtest\n"
-        "/ai — AI state"
+        "/forcescan — Force scan now\n"
+        "/backtest — 2d backtest (5m)\n"
+        "/status — Current logic\n"
+        "/results — Win stats\n"
+        "/logs — Last trades\n"
+        "/diag — Data diag"
     )
 
-def scan_command(update: Update, context: CallbackContext):
-    msg, _ = scan_market()
-    update.message.reply_text(msg)
+def scan_cmd(update: Update, context: CallbackContext):
+    head, detail = scan_market()
+    update.message.reply_text(head)
+    if detail:
+        # chunk long texts
+        for i in range(0, len(detail), 3500):
+            update.message.reply_text(detail[i:i+3500])
 
-def forcescan_command(update: Update, context: CallbackContext):
-    # Same as /scan but we surface errors directly
-    msg, _ = scan_market()
-    update.message.reply_text(f"📡 Force Scan Result:\n{msg}")
+def forcescan_cmd(update: Update, context: CallbackContext):
+    head, detail = scan_market(force=True)
+    update.message.reply_text(head)
+    if detail:
+        for i in range(0, len(detail), 3500):
+            update.message.reply_text(detail[i:i+3500])
 
-def diag_command(update: Update, context: CallbackContext):
-    msg, _ = diag_data()
-    update.message.reply_text(msg)
+def backtest_cmd(update: Update, context: CallbackContext):
+    head, detail = run_backtest(days=2)  # uses your utils
+    update.message.reply_text(head)
+    if detail:
+        for i in range(0, len(detail), 3500):
+            update.message.reply_text(detail[i:i+3500])
 
-def status_command(update: Update, context: CallbackContext):
+def status_cmd(update: Update, context: CallbackContext):
     update.message.reply_text(get_bot_status())
 
-def results_command(update: Update, context: CallbackContext):
+def results_cmd(update: Update, context: CallbackContext):
     update.message.reply_text(get_results())
 
-def logs_command(update: Update, context: CallbackContext):
-    _send_long(update.message.chat_id, get_trade_logs(30))
+def logs_cmd(update: Update, context: CallbackContext):
+    update.message.reply_text(get_trade_logs())
 
-def backtest_command(update, context):
-    # allow /backtest or /backtest 2
-    try:
-        days = int(context.args[0]) if context.args else 2
-    except Exception:
-        days = 2
-    msg = run_backtest(days=days)
-    update.message.reply_text(msg[:3900])  # avoid Telegram length errors
+def diag_cmd(update: Update, context: CallbackContext):
+    update.message.reply_text(diag_data())
 
-dispatcher.add_handler(CommandHandler("backtest", backtest_command))
+# register handlers
+dispatcher.add_handler(CommandHandler("start", start_cmd))
+dispatcher.add_handler(CommandHandler("menu", menu_cmd))
+dispatcher.add_handler(CommandHandler("scan", scan_cmd))
+dispatcher.add_handler(CommandHandler("forcescan", forcescan_cmd))
+dispatcher.add_handler(CommandHandler("backtest", backtest_cmd))
+dispatcher.add_handler(CommandHandler("status", status_cmd))
+dispatcher.add_handler(CommandHandler("results", results_cmd))
+dispatcher.add_handler(CommandHandler("logs", logs_cmd))
+dispatcher.add_handler(CommandHandler("diag", diag_cmd))
 
-def ai_command(update: Update, context: CallbackContext):
-    update.message.reply_text(get_ai_status())
-
-# register
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CommandHandler("menu", menu))
-dispatcher.add_handler(CommandHandler("scan", scan_command))
-dispatcher.add_handler(CommandHandler("forcescan", forcescan_command))
-dispatcher.add_handler(CommandHandler("diag", diag_command))
-dispatcher.add_handler(CommandHandler("status", status_command))
-dispatcher.add_handler(CommandHandler("results", results_command))
-dispatcher.add_handler(CommandHandler("logs", logs_command))
-dispatcher.add_handler(CommandHandler("backtest", backtest_command))
-dispatcher.add_handler(CommandHandler("ai", ai_command))
-
-# in bot.py after dispatcher setup:
-import threading, time
-from utils import momentum_pulse
-
-OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
-
-def _ping_loop(bot):
-    while True:
-        try:
-            msg = momentum_pulse()
-            if msg and OWNER_CHAT_ID:
-                bot.send_message(chat_id=OWNER_CHAT_ID, text=msg)
-        except Exception:
-            pass
-        time.sleep(60)
-
-threading.Thread(target=_ping_loop, args=(bot,), daemon=True).start()
-
-# webhook routes
+# webhook endpoint
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
     return "ok"
 
-@app.route("/")
+@app.route("/", methods=["GET", "HEAD"])
 def index():
     return "🌀 SpiralBot Running"
 
-if __name__ == "__main__":
-    # set webhook
+def main():
+    # IMPORTANT: start background threads only AFTER bot exists
+    start_background(bot)
     bot.set_webhook(WEBHOOK_URL)
-    # start background momentum/manager loop
-    try:
-        if OWNER_CHAT_ID:
-            start_background(bot)
-    except Exception:
-        pass
-    # run flask
+    if OWNER:
+        bot.send_message(chat_id=OWNER, text=f"✅ Webhook set: {WEBHOOK_URL}")
     app.run(host="0.0.0.0", port=PORT)
+
+if __name__ == "__main__":
+    main()
