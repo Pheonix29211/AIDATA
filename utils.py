@@ -9,7 +9,8 @@ SYMBOL = os.getenv("SYMBOL", "BTCUSDT").upper()
 PRIMARY_TF = os.getenv("PRIMARY_TF", "5m").lower()          # "5m" default
 MOMENTUM_TF = os.getenv("MOMENTUM_TF", "1m").lower()        # ping on 1m
 FILTER_TF = os.getenv("FILTER_TF", "15m").lower()           # HTF filter
-
+FIVE_MIN_LIMIT     = int(os.getenv("FIVE_MIN_LIMIT", "700"))   # ~2 days of 5m bars
+FIFTEEN_MIN_LIMIT  = int(os.getenv("FIFTEEN_MIN_LIMIT", "300"))# ~2 days of 15m bars
 AI_THRESHOLD = float(os.getenv("AI_THRESHOLD", "0.52"))     # gate to allow entries
 
 SL_CAP_BASE = float(os.getenv("SL_CAP_BASE", "300"))

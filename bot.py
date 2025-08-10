@@ -67,8 +67,16 @@ def results_command(update: Update, context: CallbackContext):
 def logs_command(update: Update, context: CallbackContext):
     _send_long(update.message.chat_id, get_trade_logs(30))
 
-def backtest_command(update: Update, context: CallbackContext):
-    _send_long(update.message.chat_id, run_backtest(days=2))
+def backtest_command(update, context):
+    # allow /backtest or /backtest 2
+    try:
+        days = int(context.args[0]) if context.args else 2
+    except Exception:
+        days = 2
+    msg = run_backtest(days=days)
+    update.message.reply_text(msg[:3900])  # avoid Telegram length errors
+
+dispatcher.add_handler(CommandHandler("backtest", backtest_command))
 
 def ai_command(update: Update, context: CallbackContext):
     update.message.reply_text(get_ai_status())
