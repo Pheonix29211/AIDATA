@@ -1,176 +1,171 @@
-import os
-import io
-import time
-import threading
+# bot.py — Telegram webhook, commands, single-trade lock, momentum pings + early-exit
+import os, threading, time
 from flask import Flask, request
-from telegram import Bot, Update
+from telegram import Update, Bot
 from telegram.ext import Dispatcher, CommandHandler, CallbackContext
+from utils import scan_market, get_trade_logs, get_bot_status, get_results, check_data_source, record_trade, fetch_mexc, compute_indicators
 
-from utils import (
-    scan_market,
-    run_backtest_stream,
-    get_trade_logs,
-    get_results,
-    check_data_source,
-    quick_diag,
-    momentum_tick,
-)
-
-# ----------------- Config -----------------
 TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN missing")
+OWNER = os.getenv("OWNER_CHAT_ID")
+PORT = int(os.getenv("PORT","10000"))
+HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME","localhost")
 
-WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/{TOKEN}"
-PORT = int(os.environ.get("PORT", 10000))
-AUTO_SCAN = os.getenv("AUTO_SCAN", "1") == "1"
-
-bot = Bot(token=TOKEN)
+bot = Bot(TOKEN)
 app = Flask(__name__)
-dispatcher = Dispatcher(bot=bot, update_queue=None, workers=4, use_context=True)
+dp = Dispatcher(bot=bot, update_queue=None, workers=4, use_context=True)
 
-MAX_TG = 3800
+# single-trade lock (in-process)
+active_trade = None
 
-# ----------------- Helpers -----------------
-def send_text_chunks(chat_id, text):
-    if len(text) <= MAX_TG:
-        bot.send_message(chat_id, text)
+def start(update: Update, ctx: CallbackContext):
+    update.message.reply_text("🌀 SpiralAI online. Use /menu")
+
+def menu(update: Update, ctx: CallbackContext):
+    update.message.reply_text("🌀 Menu:\n/scan\n/forcescan\n/status\n/results\n/logs\n/check")
+
+def scan_cmd(update: Update, ctx: CallbackContext):
+    global active_trade
+    if active_trade is not None:
+        update.message.reply_text("⏳ Trade active; waiting for exit.")
         return
-    for i in range(0, len(text), MAX_TG):
-        bot.send_message(chat_id, text[i:i + MAX_TG])
+    txt, sig = scan_market()
+    update.message.reply_text(txt)
+    if sig:
+        active_trade = {**sig, "open_price": sig["entry"]}
+        threading.Thread(target=_momentum_loop, args=(active_trade.copy(),), daemon=True).start()
 
-def send_backtest(chat_id, lines):
-    msg = "\n".join(lines or [])
-    if not msg:
-        bot.send_message(chat_id, "(Backtest finished.)")
-        return
-    if len(msg) <= MAX_TG:
-        bot.send_message(chat_id, msg)
-    else:
-        bio = io.BytesIO(msg.encode("utf-8"))
-        bio.name = f"backtest_{int(time.time())}.txt"
-        bot.send_document(chat_id, bio, caption="📜 Backtest results (full)")
+def forcescan_cmd(update: Update, ctx: CallbackContext):
+    # bypass one-trade lock to just produce a signal text (no thread)
+    txt, sig = scan_market()
+    update.message.reply_text("📡 Force Scan Result:\n" + txt)
 
-# ----------------- Commands -----------------
-def start_cmd(update: Update, _: CallbackContext):
-    update.message.reply_text(
-        "🌀 SpiralBot Online\n\n"
-        "/menu — Commands\n"
-        "/scan — Manual scan (live)\n"
-        "/forcescan — Force scan now\n"
-        "/logs — Last 30 trades\n"
-        "/results — Win stats\n"
-        "/backtest — 2-day backtest (e.g. /backtest 3)\n"
-        "/check_data — Verify data source\n"
-        "/diag — Last API responses"
-    )
+def status_cmd(u,c): u.message.reply_text(get_bot_status())
 
-def menu_cmd(update: Update, context: CallbackContext):
-    start_cmd(update, context)
+def results_cmd(u,c):
+    n,w,l,net = get_results()
+    u.message.reply_text(f"📈 Results: {n} trades | ✅ {w} / ❌ {l} | Net ${net:.2f}")
 
-def scan_cmd(update: Update, _: CallbackContext):
-    title, body = scan_market()
-    bot.send_message(update.effective_chat.id, f"{title or 'ℹ️'}\n{body}")
-
-def forcescan_cmd(update: Update, _: CallbackContext):
-    title, body = scan_market()
-    bot.send_message(update.effective_chat.id, f"{title or 'ℹ️'}\n{body}")
-
-def logs_cmd(update: Update, _: CallbackContext):
-    logs = get_trade_logs(30)
+def logs_cmd(u,c):
+    logs = get_trade_logs(20)
     if not logs:
-        bot.send_message(update.effective_chat.id, "No trades logged yet.")
+        u.message.reply_text("No trades yet."); 
         return
     lines = []
-    for t in logs[-30:]:
-        lines.append(
-            f"{t.get('time','')} | {t.get('signal','').upper()} | "
-            f"Entry {round(t.get('entry',0))} | SL {round(t.get('sl',0))} | "
-            f"TP1 {round(t.get('tp1',0))}→TP2 {round(t.get('tp2',0))} | "
-            f"RSI {round(t.get('rsi',0),1)} | Score {t.get('score','?')}/3 | src {t.get('source','')}"
-        )
-    send_text_chunks(update.effective_chat.id, "🧾 Recent Trades:\n" + "\n".join(lines))
+    for x in logs[-15:]:
+        side = x.get('side','').upper()
+        en = float(x.get('entry',0))
+        pnl = float(x.get('pnl',0))
+        t = x.get('time','')[:16].replace('T',' ')
+        lines.append(f"{t} {side} @ {en:.2f} PnL {pnl:.2f}")
+    msg = "\n".join(lines)
+    u.message.reply_text(msg[:4000])
 
-def results_cmd(update: Update, _: CallbackContext):
-    total, wins, win_rate, avg_score = get_results()
-    bot.send_message(
-        update.effective_chat.id,
-        f"📈 Results:\nTrades: {total}\nWins: {wins}\nWin rate: {win_rate}%\nAvg score: {avg_score}"
-    )
+def check_cmd(u,c): u.message.reply_text(check_data_source())
 
-def backtest_cmd(update: Update, _: CallbackContext):
-    try:
-        parts = update.message.text.strip().split()
-        days = int(parts[1]) if len(parts) > 1 else 2
-    except Exception:
-        days = 2
-    lines = run_backtest_stream(days=days)
-    send_backtest(update.effective_chat.id, lines)
+# ---- momentum loop with BE/Trail & early-exit ----
+def _momentum_loop(trade):
+    global active_trade
+    entry = float(trade["entry"])
+    side  = trade["side"]
+    sl    = float(trade["sl"])
+    tp1   = float(trade["tp1"])
+    tp2   = float(trade["tp2"])
+    chat_id = OWNER
+    trail_after = float(os.getenv("TRAIL_AFTER_TP1", "80"))
+    early_exit_on = os.getenv("EARLY_EXIT_ENABLE","true").lower()=="true"
+    need_5m = os.getenv("EARLY_EXIT_REQUIRE_5M","true").lower()=="true"
 
-def check_data_cmd(update: Update, _: CallbackContext):
-    bot.send_message(update.effective_chat.id, check_data_source())
+    tp1_tagged = False
+    be_stop    = sl
 
-def diag_cmd(update: Update, _: CallbackContext):
-    bot.send_message(update.effective_chat.id, "🔧 Diag:\n" + quick_diag())
-
-# ----------------- Register -----------------
-dispatcher.add_handler(CommandHandler("start", start_cmd))
-dispatcher.add_handler(CommandHandler("menu", menu_cmd))
-dispatcher.add_handler(CommandHandler("help", menu_cmd))
-dispatcher.add_handler(CommandHandler("scan", scan_cmd))
-dispatcher.add_handler(CommandHandler("forcescan", forcescan_cmd))
-dispatcher.add_handler(CommandHandler("logs", logs_cmd))
-dispatcher.add_handler(CommandHandler("results", results_cmd))
-dispatcher.add_handler(CommandHandler("backtest", backtest_cmd))
-dispatcher.add_handler(CommandHandler("check_data", check_data_cmd))
-dispatcher.add_handler(CommandHandler("diag", diag_cmd))
-
-# ----------------- Auto-Scan Loop -----------------
-def auto_scan_loop():
-    interval = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
-    chat_id = os.getenv("OWNER_CHAT_ID")
-    if not chat_id:
-        print("⚠️ AUTO_SCAN enabled but OWNER_CHAT_ID not set.")
-        return
-    cooldown = int(os.getenv("ALERT_COOLDOWN_SECONDS", "180"))
-    last_sent = 0
-
-    while True:
+    while active_trade is not None and active_trade is trade:
         try:
-            # 1) Live entry scan (15m + 5m authority)
-            title, body = scan_market()
-            if title and body:
-                now_ts = time.time()
-                if now_ts - last_sent > cooldown:
-                    bot.send_message(chat_id=chat_id, text=f"{title}\n{body}")
-                    last_sent = now_ts
-        except Exception as e:
-            print("Auto-scan error:", e)
+            df1 = fetch_mexc("1m", limit=60)
+            if df1 is None or len(df1) < 25:
+                time.sleep(60); 
+                continue
+            px = float(df1["close"].iloc[-1])
+            d1 = compute_indicators(df1).iloc[-1]
+            ema_bull_1m = d1["ema9"] > d1["ema21"]
+            above_vwap_1m = d1["close"] > d1["vwap"]
+            rsi_1m = float(d1["rsi"])
 
-        try:
-            # 2) Momentum pings every loop (1m cadence)
-            m_title, m_body = momentum_tick()
-            if m_title and m_body:
-                bot.send_message(chat_id=chat_id, text=f"{m_title}\n{m_body}")
-        except Exception as e:
-            print("Momentum tick error:", e)
+            df5 = fetch_mexc("5m", limit=80)
+            d5 = compute_indicators(df5).iloc[-1] if (df5 is not None and len(df5)>30) else None
+            ema_bull_5m = (d5["ema9"] > d5["ema21"]) if d5 is not None else None
+            above_vwap_5m = (d5["close"] > d5["vwap"]) if d5 is not None else None
+            rsi_5m = float(d5["rsi"]) if d5 is not None else None
 
-        time.sleep(interval)
+            if side == "long":
+                if not tp1_tagged and px >= tp1:
+                    tp1_tagged = True
+                    be_stop = max(entry, px - trail_after)
+                    bot.send_message(chat_id, f"✅ TP1 @ {px:.2f} — stop to BE / trail ${trail_after}")
+                if tp1_tagged:
+                    be_stop = max(be_stop, px - trail_after)
 
-# ----------------- Webhook -----------------
+                if px <= be_stop:
+                    bot.send_message(chat_id, f"❌ Exit @ {px:.2f} (BE/Trail)")
+                    record_trade(trade, px - entry); active_trade=None; break
+                if px >= tp2:
+                    bot.send_message(chat_id, f"🏁 TP2 @ {px:.2f} — closing")
+                    record_trade(trade, tp2 - entry); active_trade=None; break
+
+                if early_exit_on:
+                    one_min_flip = (not ema_bull_1m) and (not above_vwap_1m)
+                    five_min_conf = (d5 is None) or ((not ema_bull_5m) or (rsi_5m is not None and rsi_5m < 50))
+                    if one_min_flip and (five_min_conf if need_5m else True):
+                        bot.send_message(chat_id, f"⚠️ Momentum weakening — exit @ {px:.2f}")
+                        record_trade(trade, px - entry); active_trade=None; break
+
+            else:  # short
+                if not tp1_tagged and px <= tp1:
+                    tp1_tagged = True
+                    be_stop = min(entry, px + trail_after)
+                    bot.send_message(chat_id, f"✅ TP1 @ {px:.2f} — stop to BE / trail ${trail_after}")
+                if tp1_tagged:
+                    be_stop = min(be_stop, px + trail_after)
+
+                if px >= be_stop:
+                    bot.send_message(chat_id, f"❌ Exit @ {px:.2f} (BE/Trail)")
+                    record_trade(trade, entry - px); active_trade=None; break
+                if px <= tp2:
+                    bot.send_message(chat_id, f"🏁 TP2 @ {px:.2f} — closing")
+                    record_trade(trade, entry - tp2); active_trade=None; break
+
+                if early_exit_on:
+                    one_min_flip = (ema_bull_1m) and (above_vwap_1m)
+                    five_min_conf = (d5 is None) or (ema_bull_5m or (rsi_5m is not None and rsi_5m > 50))
+                    if one_min_flip and (five_min_conf if need_5m else True):
+                        bot.send_message(chat_id, f"⚠️ Momentum weakening — exit @ {px:.2f}")
+                        record_trade(trade, entry - px); active_trade=None; break
+
+            bot.send_message(chat_id, f"📈 Hold: {side.upper()} px={px:.2f} | BE/Trail={be_stop:.2f} | TP2={tp2:.2f}")
+        except Exception:
+            pass
+        time.sleep(60)
+
+# Handlers
+dp.add_handler(CommandHandler("start", start))
+dp.add_handler(CommandHandler("menu", menu))
+dp.add_handler(CommandHandler("scan", scan_cmd))
+dp.add_handler(CommandHandler("forcescan", forcescan_cmd))
+dp.add_handler(CommandHandler("status", status_cmd))
+dp.add_handler(CommandHandler("results", results_cmd))
+dp.add_handler(CommandHandler("logs", logs_cmd))
+dp.add_handler(CommandHandler("check", check_cmd))
+
+# Webhook
 @app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
+def wh():
     update = Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
+    dp.process_update(update)
     return "ok"
 
 @app.route("/")
-def index():
-    return "🌀 SpiralBot Running"
+def idx():
+    return "🌀 SpiralAI running"
 
 if __name__ == "__main__":
-    if AUTO_SCAN:
-        threading.Thread(target=auto_scan_loop, daemon=True).start()
-    bot.set_webhook(WEBHOOK_URL)
-    print("✅ Webhook set:", WEBHOOK_URL)
+    bot.set_webhook(f"https://{HOST}/{TOKEN}")
     app.run(host="0.0.0.0", port=PORT)
