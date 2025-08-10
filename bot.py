@@ -2,7 +2,8 @@ import os
 from flask import Flask, request
 from telegram import Bot, Update
 from telegram.ext import Dispatcher, CommandHandler, CallbackContext
-
+from utils import start_background
+start_background(bot)
 from utils import (
     scan_market, diag_data, run_backtest, get_bot_status,
     get_results, get_trade_logs, start_background, get_ai_status

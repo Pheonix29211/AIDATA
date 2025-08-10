@@ -559,3 +559,69 @@ def get_results() -> str:
     sls  = sum(1 for r in rows if r.get("outcome") == "SL")
     total = len(rows)
     return json.dumps([total, wins, tp2, sls])
+# --- background workers (auto-scan & momentum pings) ---
+import threading, time, os
+
+__bg_started = False
+
+def _chunk_text(s: str, n: int = 3500):
+    if not s:
+        return []
+    return [s[i:i+n] for i in range(0, len(s), n)]
+
+def start_background(bot):
+    """
+    Launch background threads:
+      - scan loop: calls scan_market() every SCAN_INTERVAL_SEC (default 60s)
+      - momentum loop: calls momentum_ping() every PING_INTERVAL_SEC if defined
+    Sends output to OWNER_CHAT_ID if set.
+    """
+    global __bg_started
+    if __bg_started:
+        return
+    __bg_started = True
+
+    owner = os.getenv("OWNER_CHAT_ID")
+    scan_every = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
+    ping_every = int(os.getenv("PING_INTERVAL_SEC", "60"))
+
+    # --- scan loop ---
+    def _scan_loop():
+        while True:
+            try:
+                result = scan_market()           # must return (header, detail) or (text, None)
+                if isinstance(result, tuple):
+                    header, detail = result
+                else:
+                    header, detail = str(result), None
+
+                if owner and header:
+                    bot.send_message(chat_id=owner, text=header)
+                    if detail:
+                        for chunk in _chunk_text(detail):
+                            bot.send_message(chat_id=owner, text=chunk)
+            except Exception as e:
+                if owner:
+                    bot.send_message(chat_id=owner, text=f"❌ Auto-scan error: {e}")
+            time.sleep(scan_every)
+
+    # --- momentum loop (optional) ---
+    def _momo_loop():
+        # If you have a momentum_ping() in utils, we’ll use it; otherwise this thread idles
+        ping_fn = globals().get("momentum_ping")
+        if not callable(ping_fn):
+            return
+        while True:
+            try:
+                text = ping_fn()
+                if owner and text:
+                    for chunk in _chunk_text(text):
+                        bot.send_message(chat_id=owner, text=chunk)
+            except Exception as e:
+                if owner:
+                    bot.send_message(chat_id=owner, text=f"❌ Momentum ping error: {e}")
+            time.sleep(ping_every)
+
+    threading.Thread(target=_scan_loop, daemon=True).start()
+    threading.Thread(target=_momo_loop, daemon=True).start()
+
