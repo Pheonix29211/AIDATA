@@ -1,369 +1,348 @@
 # utils.py
-import os, json, math, time
-from datetime import datetime, timezone, timedelta
+import os, json, time, math, logging
+from datetime import datetime, timezone
+from typing import Tuple, Optional
+
 import requests
 import pandas as pd
 import numpy as np
 
-# ====== CONFIG ======
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT").upper()
-TZ = os.getenv("TZ", "Asia/Kolkata")
-TRADE_LOG = os.getenv("TRADE_LOG_FILE", "trade_logs.json")
+# ---------- Config (defaults are safe) ----------
+SYMBOL              = os.getenv("SYMBOL", "BTCUSDT").upper()  # MEXC spot symbol
+TRADES_FILE         = os.getenv("TRADES_FILE", "trade_logs.json")
 
-# Risk/Target (dollars)
-SL_CAP_BASE = float(os.getenv("SL_CAP_BASE", "300"))
-TP1_DOLLARS = float(os.getenv("TP1_DOLLARS", "600"))
-TP2_DOLLARS = float(os.getenv("TP2_DOLLARS", "1500"))
+# Entry filters (Engulfing removed → trend + RSI band only)
+RSI_MIN             = float(os.getenv("RSI_MIN", "30"))
+RSI_MAX             = float(os.getenv("RSI_MAX", "70"))
+EMA_FAST            = int(os.getenv("EMA_FAST", "9"))
+EMA_SLOW            = int(os.getenv("EMA_SLOW", "21"))
 
-# Filters (tweak via env if needed)
-RSI_MIN = float(os.getenv("RSI_MIN", "32"))
-RSI_MAX = float(os.getenv("RSI_MAX", "68"))
-ENGULF_LOOKBACK = int(os.getenv("ENGULF_LOOKBACK", "3"))
-AI_MIN = float(os.getenv("AI_MIN", "0.0"))  # set >0.0 if you want to gate by AI
-ENABLE_BREAKOUT = os.getenv("ENABLE_BREAKOUT", "false").lower() == "true"
-ENABLE_PULLBACK = os.getenv("ENABLE_PULLBACK", "false").lower() == "true"
+# Risk/TP in USD distance (not points)
+SL_CAP_BASE         = float(os.getenv("SL_CAP_BASE", "300"))   # base SL target
+SL_CAP_MAX          = float(os.getenv("SL_CAP_MAX", "500"))   # max extension AI/logic may allow
+SL_CUSHION_DOLLARS  = float(os.getenv("SL_CUSHION_DOLLARS", "50"))  # wiggle beyond SL if momentum flips back
+TP1_DOLLARS         = float(os.getenv("TP1_DOLLARS", "600"))  # initial TP
+TP2_DOLLARS         = float(os.getenv("TP2_DOLLARS", "1500")) # runner target
 
-# ====== AI CORE HOOKS ======
-try:
-    from ai_core import score as ai_score, online_update, register_outcome
-except Exception:
-    def ai_score(features, regime): return (0.50, 0.05)
-    def online_update(features, regime, reward): pass
-    def register_outcome(outcome): pass
+# AI gate (optional score coming from ai_core; if not present we default 0.50)
+AI_MIN              = float(os.getenv("AI_MIN", "0.50"))
 
-LAST_AI_SCORE = None
-LAST_AI_EXPLORE = None
-LAST_REGIME = "?"
+# Autoscan timing text (bot handles scheduling; we just print)
+SCAN_TF             = os.getenv("SCAN_TF", "5m").lower()  # main decision timeframe
 
-# ====== LOG FILE HELPERS ======
-def _ensure_log_file():
-    if not os.path.exists(TRADE_LOG):
-        with open(TRADE_LOG, "w") as f:
-            f.write("[]")
+# Valid TFs for MEXC v3
+_VALID_TF = {"1m","5m","15m","30m","1h"}
 
-def _load_logs():
-    _ensure_log_file()
+# ---------- Safe JSON helpers ----------
+def _load_json_safe(path: str, default):
     try:
-        with open(TRADE_LOG, "r") as f:
-            return json.load(f)
+        if not os.path.exists(path):
+            return default
+        with open(path, "r", encoding="utf-8") as f:
+            txt = f.read().strip()
+            if not txt:
+                return default
+            return json.loads(txt)
     except Exception:
-        with open(TRADE_LOG, "w") as f:
-            f.write("[]")
-        return []
+        return default
 
-def _save_logs(logs):
-    with open(TRADE_LOG, "w") as f:
-        json.dump(logs, f, indent=2)
+def _append_json_line_safe(path: str, obj: dict, max_keep: int = 2000):
+    data = _load_json_safe(path, [])
+    data.append(obj)
+    if len(data) > max_keep:
+        data = data[-max_keep:]
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        logging.error(f"Failed to write {path}: {e}")
 
-# ====== INDICATORS ======
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["ema_fast"] = df["close"].ewm(span=20).mean()
-    df["ema_slow"] = df["close"].ewm(span=50).mean()
-    # RSI 14
-    delta = df["close"].diff()
-    gain = (delta.where(delta > 0, 0.0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean().replace(0, np.nan)
-    rs = gain / loss
-    df["rsi"] = 100 - (100 / (1 + rs))
-    df["rsi"] = df["rsi"].fillna(50)
-    # VWAP (running)
-    typical = (df["high"] + df["low"] + df["close"]) / 3.0
-    df["vwap"] = (typical * df["volume"]).cumsum() / df["volume"].replace(0, np.nan).cumsum()
-    # Engulfing
-    df["bull_engulf"] = (df["close"] > df["open"]) & (df["open"].shift(1) > df["close"].shift(1)) & (df["close"] > df["open"].shift(1)) & (df["open"] < df["close"].shift(1))
-    df["bear_engulf"] = (df["close"] < df["open"]) & (df["open"].shift(1) < df["close"].shift(1)) & (df["close"] < df["open"].shift(1)) & (df["open"] > df["close"].shift(1))
+# ---------- Data: MEXC v3 (primary) ----------
+def _mexc_klines(symbol: str, tf: str = "5m", limit: int = 500):
+    """
+    MEXC v3 klines (public, no key needed)
+    GET https://api.mexc.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=500
+    Returns list of lists.
+    """
+    base = "https://api.mexc.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": tf, "limit": int(limit)}
+    try:
+        r = requests.get(base, params=params, timeout=10)
+        status = r.status_code
+        # Some reverse proxies may return HTML; guard JSON parsing
+        try:
+            payload = r.json()
+        except Exception:
+            payload = r.text[:400]
+        return status, payload
+    except Exception as e:
+        return 0, str(e)
+
+def _df_from_mexc(payload) -> Optional[pd.DataFrame]:
+    """
+    Convert MEXC kline array payload → DataFrame with OHLCV and tz-aware index.
+    """
+    if not isinstance(payload, list) or not payload or not isinstance(payload[0], (list,tuple)):
+        return None
+    # MEXC columns:
+    # 0 open time(ms) 1 open 2 high 3 low 4 close 5 volume 6 close time(ms) ...
+    arr = np.array(payload, dtype=object)
+    ts  = pd.to_datetime(arr[:,0].astype(np.int64), unit="ms", utc=True).tz_convert("Asia/Kolkata")
+    df = pd.DataFrame({
+        "open":   pd.to_numeric(arr[:,1], errors="coerce"),
+        "high":   pd.to_numeric(arr[:,2], errors="coerce"),
+        "low":    pd.to_numeric(arr[:,3], errors="coerce"),
+        "close":  pd.to_numeric(arr[:,4], errors="coerce"),
+        "volume": pd.to_numeric(arr[:,5], errors="coerce"),
+    }, index=ts)
+    df = df.dropna()
+    if df.empty:
+        return None
     return df
 
-# ====== AI GAUGE ======
-def _compute_ai_gauge(df: pd.DataFrame):
-    global LAST_AI_SCORE, LAST_AI_EXPLORE, LAST_REGIME
-    last = df.iloc[-1]
-    ema_fast = df["ema_fast"].iloc[-1]
-    ema_slow = df["ema_slow"].iloc[-1]
-    vwap = df["vwap"].iloc[-1]
-    if ema_fast > ema_slow and last["close"] > vwap:
-        regime = "trend"
-    elif ema_fast < ema_slow and last["close"] < vwap:
-        regime = "trend"
-    else:
-        regime = "range"
-    ema_spread = float((ema_fast - ema_slow) / max(1e-9, abs(ema_slow)))
-    ema_slope = float(df["ema_fast"].iloc[-1] - df["ema_fast"].iloc[-5]) if len(df) >= 6 else 0.0
-    p, explore = ai_score({"ema_spread": ema_spread, "ema_slope": ema_slope}, regime)
-    LAST_AI_SCORE = float(p); LAST_AI_EXPLORE = float(explore); LAST_REGIME = regime
-    return p, explore, regime
-
-def get_ai_status():
-    if LAST_AI_SCORE is None:
-        return "🤖 AI: no reading yet."
-    return f"🤖 AI score {LAST_AI_SCORE:.2f} | explore {LAST_AI_EXPLORE:.2f} | regime {LAST_REGIME}"
-
-# ====== MEXC (old working v3) ======
-_MEXC_V3_MAIN = "https://api.mexc.com/api/v3/klines"
-_MEXC_V3_ALT  = "https://www.mexc.com/api/v3/klines"  # sometimes HTML
-_VALID_TF = {"1m","5m","15m","30m","1h","4h","1d"}
-_last_mexc_diag = {"status": None, "endpoint": None, "preview": None}
-
-def _mexc_raw(symbol: str, interval: str, limit: int = 500):
-    params = {"symbol": symbol, "interval": interval, "limit": min(1000, int(limit))}
-    for url in (_MEXC_V3_MAIN, _MEXC_V3_ALT):
-        try:
-            r = requests.get(url, params=params, timeout=10)
-            try:
-                data = r.json()
-                _last_mexc_diag.update({"status": r.status_code, "endpoint": url, "preview": "JSON ok"})
-                return r.status_code, data
-            except Exception:
-                _last_mexc_diag.update({"status": r.status_code, "endpoint": url, "preview": (r.text[:250] if r.text else "no text")})
-                return r.status_code, None
-        except Exception as e:
-            _last_mexc_diag.update({"status": 0, "endpoint": url, "preview": f"{type(e).__name__}: {e}"})
-            continue
-    return 0, None
-
-def fetch_mexc(tf: str = "5m", limit: int = 500):
-    tf = tf.strip().lower()
-    if tf not in _VALID_TF: return None
-    status, payload = _mexc_raw(SYMBOL, tf, limit)
-    if status == 200 and isinstance(payload, list) and payload and isinstance(payload[0], (list, tuple)):
-        rows = []
-        for k in payload:
-            try:
-                rows.append([int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])])
-            except Exception:
-                continue
-        if not rows: return None
-        df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume"])
-        df["time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.tz_convert(TZ)
-        df.set_index("time", inplace=True)
-        return df[["open","high","low","close","volume"]]
+def fetch_mexc(tf: str = "5m", limit: int = 500) -> Optional[pd.DataFrame]:
+    tf = tf.lower().strip()
+    if tf not in _VALID_TF:
+        tf = "5m"
+    status, payload = _mexc_klines(SYMBOL, tf, limit)
+    if status == 200:
+        df = _df_from_mexc(payload)
+        return df
+    # Optional hourly retry (MEXC sometimes flaky on 1h)
+    if tf == "1h":
+        status2, payload2 = _mexc_klines(SYMBOL, "60m", limit)
+        if status2 == 200:
+            return _df_from_mexc(payload2)
     return None
 
-# Optional Bybit fallback (kept minimal; not required if MEXC is fine)
-def fetch_bybit(tf: str = "5m", limit: int = 500):
-    tfmap = {"1m":"1","5m":"5","15m":"15","30m":"30","1h":"60"}
-    if tf not in tfmap: return None
-    try:
-        url = "https://api.bybit.com/v5/market/kline"
-        params = {"category":"linear", "symbol": SYMBOL, "interval": tfmap[tf], "limit": min(limit, 1000)}
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        if data.get("retCode") != 0: return None
-        kl = data["result"]["list"]
-        rows = []
-        for k in kl[::-1]:
-            rows.append([int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])])
-        df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume"])
-        df["time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.tz_convert(TZ)
-        df.set_index("time", inplace=True)
-        return df[["open","high","low","close","volume"]]
-    except Exception:
-        return None
+# ---------- Indicators (no Engulfing gating used) ----------
+def _ema(x: pd.Series, n: int) -> pd.Series:
+    return x.ewm(span=n, adjust=False).mean()
 
-def diag_data():
-    out = ["📡 MEXC diag"]
-    for tf in ["1m","5m","15m","30m","1h"]:
-        df = fetch_mexc(tf, limit=200)
-        if df is None:
-            s = _last_mexc_diag.get("status"); ep = _last_mexc_diag.get("endpoint"); pv = _last_mexc_diag.get("preview")
-            out.append(f"{tf}: None | {s} | {ep} | {pv}")
-        else:
-            out.append(f"{tf}: {len(df)} bars, last={df.index[-1]}")
-    return "\n".join(out)
+def _rsi(x: pd.Series, n: int = 14) -> pd.Series:
+    delta = x.diff()
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    roll_up  = pd.Series(gain, index=x.index).ewm(alpha=1/n, adjust=False).mean()
+    roll_dn  = pd.Series(loss, index=x.index).ewm(alpha=1/n, adjust=False).mean()
+    rs = roll_up / (roll_dn.replace(0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
 
-# ====== SIGNAL BUILDING ======
-def _fmt(x: float) -> str:
-    return f"{x:,.2f}"
+def _vwap(df: pd.DataFrame, win: int = 20) -> pd.Series:
+    # session-agnostic rolling VWAP to keep it simple/cross-exchange
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    vol = df["volume"].clip(lower=0.0)
+    pv = (tp * vol).rolling(win).sum()
+    vv = vol.rolling(win).sum().replace(0, np.nan)
+    return (pv / vv).fillna(df["close"])
 
-def _build_signal(side: str, px: float):
-    if side == "LONG":
-        sl = px - SL_CAP_BASE
-        tp1 = px + TP1_DOLLARS
-        tp2 = px + TP2_DOLLARS
-        return (f"🟢 LONG @ { _fmt(px) } | SL { _fmt(sl) } "
-                f"TP { _fmt(tp1) }→{ _fmt(tp2) } [MEXC]"), sl, tp1, tp2
-    else:
-        sl = px + SL_CAP_BASE
-        tp1 = px - TP1_DOLLARS
-        tp2 = px - TP2_DOLLARS
-        return (f"🔴 SHORT @ { _fmt(px) } | SL { _fmt(sl) } "
-                f"TP { _fmt(tp1) }→{ _fmt(tp2) } [MEXC]"), sl, tp1, tp2
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["ema_fast"] = _ema(df["close"], EMA_FAST)
+    df["ema_slow"] = _ema(df["close"], EMA_SLOW)
+    df["rsi"]      = _rsi(df["close"], 14)
+    df["vwap"]     = _vwap(df, win=20)
 
-def record_trade(entry: dict):
-    logs = _load_logs()
-    logs.append(entry)
-    _save_logs(logs)
+    # regime: simple separation (trend vs range)
+    spread = (df["ema_fast"] - df["ema_slow"]).abs() / df["close"].replace(0,np.nan)
+    df["regime"] = np.where(spread > 0.0009, "trend", "range")
+    return df.dropna()
 
-def get_trade_logs():
-    logs = _load_logs()
-    if not logs:
-        return "🧾 No trades logged yet."
-    tail = logs[-30:]
-    lines = []
-    for t in tail:
-        lines.append(
-            f"{t.get('t','')} | {t.get('tf','')} | {t.get('side','')} @ {t.get('px','')} "
-            f"SL {t.get('sl','')} TP {t.get('tp1','')}→{t.get('tp2','')} "
-            f"AI {t.get('ai',0):.2f}"
-        )
-    return "🧾 Last trades:\n" + "\n".join(lines)
-
-def get_results():
-    logs = _load_logs()
-    if not logs:
-        return "📈 No results yet."
-    wins = sum(1 for t in logs if t.get("outcome") in ("TP1","TP2"))
-    tp2  = sum(1 for t in logs if t.get("outcome") == "TP2")
-    sls  = sum(1 for t in logs if t.get("outcome") == "SL")
-    open_count = sum(1 for t in logs if t.get("outcome") == "OPEN")
-    return f"📈 Results: wins {wins}, TP2 {tp2}, SL {sls}, open {open_count} (total {len(logs)})"
-
-def get_bot_status():
-    return (
-        "📊 Current Logic:\n"
-        f"- {SYMBOL} on MEXC (v3)\n"
-        f"- VWAP/EMA cross (5m)\n"
-        f"- RSI {RSI_MIN:.0f}–{RSI_MAX:.0f} + Engulfing (lookback {ENGULF_LOOKBACK})\n"
-        f"- ${SL_CAP_BASE:.0f} SL, ${TP1_DOLLARS:.0f}–${TP2_DOLLARS:.0f} TP\n"
-        f"- Breakout {ENABLE_BREAKOUT}, Pullback {ENABLE_PULLBACK}\n"
-    )
-
-# ====== SCAN ======
-def scan_market():
-    # 5m TF by default
-    df = fetch_mexc("5m", limit=600)
-    if df is None or len(df) < 60:
-        df = fetch_bybit("5m", limit=600)
-    if df is None or len(df) < 60:
-        return ("❌ Data Error:", "No 5m data from MEXC or Bybit. Try /diag then /forcescan.")
-
-    # build indicators + AI
-    df = compute_indicators(df)
-    p, explore, regime = _compute_ai_gauge(df)
-
+# ---------- Signal logic (Engulfing removed) ----------
+def _make_signal(df: pd.DataFrame, tf: str = "5m", ai_score: float = 0.50) -> Tuple[str, str]:
+    """
+    Returns (header, detail). If no trade, header explains why.
+    """
     last = df.iloc[-1]
     trend_up = (last["ema_fast"] > last["ema_slow"]) and (last["close"] > last["vwap"])
     trend_dn = (last["ema_fast"] < last["ema_slow"]) and (last["close"] < last["vwap"])
 
-    bull_recent = df["bull_engulf"].rolling(ENGULF_LOOKBACK).max().iloc[-2]
-    bear_recent = df["bear_engulf"].rolling(ENGULF_LOOKBACK).max().iloc[-2]
+    # Base filters: trend + RSI band (Engulfing removed)
+    long_base  = trend_up and (RSI_MIN <= last["rsi"] <= RSI_MAX)
+    short_base = trend_dn and (RSI_MIN <= last["rsi"] <= RSI_MAX)
 
-    long_base  = trend_up and (last["rsi"] <= RSI_MAX) and bool(bull_recent)
-    short_base = trend_dn and (last["rsi"] >= RSI_MIN) and bool(bear_recent)
+    regime = last.get("regime","range")
+    side = None
+    if long_base and ai_score >= AI_MIN:
+        side = "LONG"
+    elif short_base and ai_score >= AI_MIN:
+        side = "SHORT"
 
-    breakout_long = breakout_short = False
-    if ENABLE_BREAKOUT:
-        swing_hi = df["high"].rolling(20).max().iloc[-2]
-        swing_lo = df["low"].rolling(20).min().iloc[-2]
-        vol_up = last["volume"] > df["volume"].rolling(20).mean().iloc[-1]
-        breakout_long = trend_up and last["close"] > swing_hi and vol_up
-        breakout_short = trend_dn and last["close"] < swing_lo and vol_up
+    if side is None:
+        return (f"ℹ️ No trade | TF {tf} | Regime {regime} | AI {ai_score:.2f}",
+                f"close={last['close']:.2f} rsi={last['rsi']:.1f} vwap={last['vwap']:.2f} emaΔ={(last['ema_fast']-last['ema_slow']):.2f}")
 
-    pullback_long = pullback_short = False
-    if ENABLE_PULLBACK:
-        ema20_prev = df["close"].ewm(span=20).mean().iloc[-2]
-        pullback_long = trend_up and (df["low"].iloc[-2] <= ema20_prev <= df["high"].iloc[-2]) and (last["close"] > ema20_prev)
-        pullback_short = trend_dn and (df["low"].iloc[-2] <= ema20_prev <= df["high"].iloc[-2]) and (last["close"] < ema20_prev)
+    # Build USD SL/TP ladder
+    price = float(last["close"])
+    if side == "LONG":
+        sl  = price - SL_CAP_BASE
+        tp1 = price + TP1_DOLLARS
+        tp2 = price + TP2_DOLLARS
+    else:
+        sl  = price + SL_CAP_BASE
+        tp1 = price - TP1_DOLLARS
+        tp2 = price - TP2_DOLLARS
 
-    long_ok  = long_base  or breakout_long  or pullback_long
-    short_ok = short_base or breakout_short or pullback_short
-
-    # Optional AI gating
-    if AI_MIN > 0.0:
-        if long_ok and p < AI_MIN:  long_ok = False
-        if short_ok and p < AI_MIN: short_ok = False
-
-    # No-trade path
-    if not (long_ok ^ short_ok):
-        head = "ℹ️ No trade"
-        details = f"TF 5m | Regime {regime} | AI {p:.2f}"
-        return head, details
-
-    side = "LONG" if long_ok else "SHORT"
-    head, sl, tp1, tp2 = _build_signal(side, float(last["close"]))
-    details = (
-        f"TF 5m | EMA{'↑' if trend_up else '↓'} VWAP{'↑' if trend_up else '↓'} "
-        f"| RSI {last['rsi']:.1f} | Regime {regime} | AI {p:.2f}"
+    header = f"{'🟢' if side=='LONG' else '🔴'} {side} @ {price:.0f} | SL {sl:.0f} TP {tp1:.0f}→{tp2:.0f} [MEXC]"
+    detail = (
+        f"TF {tf} | Regime {regime} | AI {ai_score:.2f}\n"
+        f"close={price:.2f}  rsi={last['rsi']:.1f}\n"
+        f"vwap={last['vwap']:.2f}  ema_fast={last['ema_fast']:.2f}  ema_slow={last['ema_slow']:.2f}"
     )
+    return header, detail
 
-    # Log the signal (as OPEN idea)
-    record_trade({
-        "t": datetime.now(timezone.utc).isoformat(),
-        "tf": "5m",
-        "side": side,
-        "px": float(last["close"]),
-        "sl": float(sl),
-        "tp1": float(tp1),
-        "tp2": float(tp2),
-        "ai": float(p),
-        "outcome": "OPEN"
-    })
-    return head, details
+# ---------- Public API used by bot ----------
 
-# ====== BACKTEST (2–7 days, 5m) ======
-def run_backtest(days: int = 2):
-    bars_needed = int((days * 24 * 60) / 5) + 50  # add buffer
-    df = fetch_mexc("5m", limit=min(1000, bars_needed))
-    if df is None or len(df) < 120:
-        return ("❌ Backtest", "unable to fetch history from MEXC.")
+def scan_market(tf: str = None) -> Tuple[str, str]:
+    """
+    Called by /scan and autoscan. Returns (header, detail)
+    """
+    tf = (tf or SCAN_TF).lower()
+    df = fetch_mexc(tf, limit=500)
+    if df is None or len(df) < 50:
+        return ("❌ Data Error:\nNo data from MEXC right now.", "fetch_mexc returned None or too few rows")
+    df = compute_indicators(df)
+
+    # AI score (optional). If ai_core not present, fall back to 0.50
+    ai_score = 0.50
+    try:
+        from ai_core import score
+        # lightweight features
+        last = df.iloc[-1]
+        features = {
+            "ema_spread": float((last["ema_fast"] - last["ema_slow"]) / last["close"]),
+            "ema_slope":  float((df["ema_fast"].iloc[-1] - df["ema_fast"].iloc[-5]) / 5.0 / last["close"])
+        }
+        ai_score, _ = score(features, regime=str(last.get("regime","range")))
+    except Exception:
+        pass
+
+    return _make_signal(df, tf=tf, ai_score=ai_score)
+
+def run_backtest(days: int = 2, tf: str = "5m") -> Tuple[str, str]:
+    """
+    Super-light backtest over last N days worth of bars from MEXC.
+    Counts entries based on current logic (no Engulfing), simulates TP1/TP2/SL in USD space.
+    """
+    tf = tf.lower()
+    # rough bar count
+    bars_per_day = {"1m": 1440, "5m": 288, "15m": 96, "30m": 48, "1h": 24}.get(tf, 288)
+    limit = min(1000, max(300, days * bars_per_day))
+    df = fetch_mexc(tf, limit=limit)
+    if df is None or len(df) < 60:
+        return ("❌ Backtest: unable to fetch history from MEXC.", "")
 
     df = compute_indicators(df)
     entries = []
-    wins = tp2s = sls = 0
-    lines = []
+    for i in range(50, len(df)-1):
+        row = df.iloc[i]
+        trend_up = (row["ema_fast"] > row["ema_slow"]) and (row["close"] > row["vwap"])
+        trend_dn = (row["ema_fast"] < row["ema_slow"]) and (row["close"] < row["vwap"])
 
-    for i in range(60, len(df) - 1):
-        window = df.iloc[:i+1]
-        last = window.iloc[-1]
-        p, _, regime = _compute_ai_gauge(window)
+        long_ok  = trend_up  and (RSI_MIN <= row["rsi"] <= RSI_MAX)
+        short_ok = trend_dn  and (RSI_MIN <= row["rsi"] <= RSI_MAX)
 
-        trend_up = (last["ema_fast"] > last["ema_slow"]) and (last["close"] > last["vwap"])
-        trend_dn = (last["ema_fast"] < last["ema_slow"]) and (last["close"] < last["vwap"])
-        bull_recent = window["bull_engulf"].rolling(ENGULF_LOOKBACK).max().iloc[-2]
-        bear_recent = window["bear_engulf"].rolling(ENGULF_LOOKBACK).max().iloc[-2]
-        long_ok  = trend_up and (last["rsi"] <= RSI_MAX) and bool(bull_recent)
-        short_ok = trend_dn and (last["rsi"] >= RSI_MIN) and bool(bear_recent)
-
-        # AI gate if enabled
-        if AI_MIN > 0.0:
-            if long_ok and p < AI_MIN:  long_ok = False
-            if short_ok and p < AI_MIN: short_ok = False
-
-        if not (long_ok ^ short_ok):
+        if not (long_ok or short_ok):
             continue
 
-        side = "LONG" if long_ok else "SHORT"
-        entry = float(last["close"])
-        sl = entry - SL_CAP_BASE if side == "LONG" else entry + SL_CAP_BASE
-        tp1 = entry + TP1_DOLLARS if side == "LONG" else entry - TP1_DOLLARS
-        tp2 = entry + TP2_DOLLARS if side == "LONG" else entry - TP2_DOLLARS
+        side  = "LONG" if long_ok else "SHORT"
+        entry = float(row["close"])
+        sl    = entry - SL_CAP_BASE if side=="LONG" else entry + SL_CAP_BASE
+        tp1   = entry + TP1_DOLLARS if side=="LONG" else entry - TP1_DOLLARS
+        tp2   = entry + TP2_DOLLARS if side=="LONG" else entry - TP2_DOLLARS
 
-        # Walk forward up to next 288 bars (~1 day) or until hit
-        outcome = "OPEN"
-        for j in range(i+1, min(i+1+288, len(df))):
-            bar = df.iloc[j]
-            hi, lo = float(bar["high"]), float(bar["low"])
+        # walk forward up to 200 bars
+        outcome, bars_to_exit = "OPEN", 0
+        for j in range(i+1, min(i+200, len(df))):
+            hi = float(df["high"].iloc[j])
+            lo = float(df["low"].iloc[j])
+            bars_to_exit = j - i
+
             if side == "LONG":
-                if hi >= tp2:
-                    outcome = "TP2"; tp2s += 1; wins += 1; break
-                if hi >= tp1:
-                    outcome = "TP1"; wins += 1; break
-                if lo <= sl:
-                    outcome = "SL";  sls  += 1; break
+                hit_sl  = lo <= sl
+                hit_tp1 = hi >= tp1
+                hit_tp2 = hi >= tp2
             else:
-                if lo <= tp2:
-                    outcome = "TP2"; tp2s += 1; wins += 1; break
-                if lo <= tp1:
-                    outcome = "TP1"; wins += 1; break
-                if hi >= sl:
-                    outcome = "SL";  sls  += 1; break
+                hit_sl  = hi >= sl
+                hit_tp1 = lo <= tp1
+                hit_tp2 = lo <= tp2
 
-        entries.append((window.index[-1], side, entry, outcome))
-        if len(lines) < 80:  # avoid Telegram overflow
-            lines.append(f"{window.index[-1]} | {side} @ {entry:,.2f} → {outcome}")
+            if hit_tp2:
+                outcome = "TP2"; break
+            if hit_tp1:
+                outcome = "TP1"; break
+            if hit_sl:
+                outcome = "SL";  break
 
-    total = len(entries)
-    head = f"🧪 Backtest ({days}d, 5m): {total} entries | Wins {wins} | TP2 {tp2s} | SL {sls}"
-    details = "\n".join(lines) if lines else "(no qualifying entries)"
-    return head, details
+        entries.append((side, entry, outcome, bars_to_exit))
+
+    if not entries:
+        return ("🧪 Backtest ({}d, {}): 0 entries | Wins 0 | TP2 0 | SL 0".format(days, tf), "(no qualifying entries)")
+
+    wins  = sum(1 for _,_,o,_ in entries if o in ("TP1","TP2"))
+    tp2s  = sum(1 for _,_,o,_ in entries if o == "TP2")
+    sls   = sum(1 for _,_,o,_ in entries if o == "SL")
+    txt   = f"🧪 Backtest ({days}d, {tf}): {len(entries)} entries | Wins {wins} | TP2 {tp2s} | SL {sls}"
+    detail_lines = []
+    for idx,(side,entry,out,bars) in enumerate(entries[-20:], 1):
+        detail_lines.append(f"{idx:02d}. {side} @ {entry:.0f} → {out} in {bars} bars")
+    return txt, "\n".join(detail_lines)
+
+# ---------- Logging & status ----------
+def record_trade(payload: dict):
+    payload = dict(payload)
+    payload["ts"] = datetime.now(timezone.utc).isoformat()
+    _append_json_line_safe(TRADES_FILE, payload)
+
+def get_trade_logs(n: int = 30) -> str:
+    data = _load_json_safe(TRADES_FILE, [])
+    if not data:
+        return "No trades recorded yet."
+    lines = []
+    for item in data[-n:]:
+        ts   = item.get("ts","")
+        side = item.get("side","")
+        px   = item.get("entry_price","")
+        res  = item.get("result","")
+        lines.append(f"{ts} | {side} @ {px} → {res}")
+    return "\n".join(lines)
+
+def get_results() -> str:
+    data = _load_json_safe(TRADES_FILE, [])
+    if not data:
+        return "Results: 0 trades."
+    wins = sum(1 for x in data if x.get("result") in ("TP1","TP2"))
+    tp2  = sum(1 for x in data if x.get("result") == "TP2")
+    sls  = sum(1 for x in data if x.get("result") == "SL")
+    return f"Results: trades {len(data)} | wins {wins} | TP2 {tp2} | SL {sls}"
+
+def get_bot_status() -> str:
+    return (
+        "📊 Current Logic:\n"
+        f"- Symbol: {SYMBOL} (MEXC)\n"
+        f"- TF: {SCAN_TF}\n"
+        f"- Filters: Trend + RSI (Engulfing OFF)\n"
+        f"- RSI band: {RSI_MIN:.0f}–{RSI_MAX:.0f}\n"
+        f"- EMA: {EMA_FAST}/{EMA_SLOW}, VWAP(20)\n"
+        f"- Risk: SL ${SL_CAP_BASE:.0f} (max {SL_CAP_MAX:.0f}, cushion {SL_CUSHION_DOLLARS:.0f})\n"
+        f"- TP: ${TP1_DOLLARS:.0f} → ${TP2_DOLLARS:.0f}\n"
+        f"- AI gate ≥ {AI_MIN:.2f}\n"
+    )
+
+def check_data_source() -> str:
+    df = fetch_mexc("5m", limit=200)
+    if df is None or df.empty:
+        return "❌ TV connection failed: ❌ TradingView connection failed (we use MEXC now)\n❌ MEXC not responding."
+    last = df.index[-1]
+    return f"✅ Connected to MEXC\nLast 5m bar: {last}"
+
+def diag_data() -> str:
+    out = ["📡 MEXC diag"]
+    for tf in ["1m","5m","15m","30m","1h"]:
+        df = fetch_mexc(tf, limit=200)
+        if df is None or df.empty:
+            out.append(f"{tf}: None")
+        else:
+            out.append(f"{tf}: {len(df)} bars, last={df.index[-1]}")
+    return "\n".join(out)
