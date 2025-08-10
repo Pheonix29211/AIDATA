@@ -25,7 +25,7 @@ def env_int(name, default):
 # ==== CONFIG ====
 AI_ENABLE = os.getenv("AI_ENABLE","true").lower()=="true"
 AI_SCORE_MIN = env_float("AI_SCORE_MIN", 0.65)
-TF_LIST = [t.strip() for t in os.getenv("TF_LIST","5m,15m,30m,45m,1h").split(",")]
+TF_LIST = [t.strip() for t in os.getenv("TF_LIST","5m,15m,30m,1h").split(",")]
 AI_TF_SWITCH_EDGE = env_float("AI_TF_SWITCH_EDGE", 0.05)
 
 SL_CAP_BASE = env_float("SL_CAP_BASE", 300)
@@ -83,21 +83,24 @@ _MEXC_TF_MAP = {
 }
 def _mexc_interval(tf: str) -> str: return _MEXC_TF_MAP.get(tf,"5m")
 
-def fetch_mexc(tf="5m", limit=500):
+def fetch_mexc(tf="5m", limit=1000):
+    """
+    Request many bars + handle rate limits / HTML gracefully.
+    """
     url = "https://api.mexc.com/api/v3/klines"
     params = {"symbol": MEXC_SYMBOL, "interval": _mexc_interval(tf), "limit": int(limit)}
     headers = {"User-Agent":"Mozilla/5.0 (SpiralBot)","Accept":"application/json"}
-    for _ in range(3):
+    for _ in range(4):
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=10)
+            r = requests.get(url, params=params, headers=headers, timeout=12)
             if r.status_code != 200:
-                time.sleep(0.6); continue
+                time.sleep(0.8); continue
             try:
                 raw = r.json()
             except Exception:
-                time.sleep(0.6); continue
+                time.sleep(0.8); continue
             if not isinstance(raw, list) or len(raw)==0:
-                time.sleep(0.4); continue
+                time.sleep(0.5); continue
             cols = ["open_time","open","high","low","close","volume",
                     "close_time","qa","tbv","tq","ig1","ig2"]
             df = pd.DataFrame(raw, columns=cols[:6])
@@ -106,11 +109,11 @@ def fetch_mexc(tf="5m", limit=500):
             df.set_index("ts", inplace=True)
             return df[["open","high","low","close","volume"]]
         except Exception:
-            time.sleep(0.6)
+            time.sleep(0.8)
     return None
 
 def check_data_source():
-    df = fetch_mexc("5m", limit=50)
+    df = fetch_mexc("5m", limit=120)
     return "✅ MEXC OK" if (df is not None and len(df)>0) else "❌ MEXC FAIL"
 
 # ==== INDICATORS ====
@@ -197,8 +200,9 @@ def choose_tf():
     session = _session_from_hour(_now_utc().hour)
     best = None; best_p = -9; best_row = None
     for tf in TF_LIST:
-        df = fetch_mexc(tf, limit=220)
-        if df is None or len(df)<60: continue
+        df = fetch_mexc(tf, limit=1000)
+        if df is None or len(df) < 30:   # relaxed from 60
+            continue
         df = compute_indicators(df)
         z = df.iloc[-1]
         regime = classify_regime(z)
@@ -206,11 +210,11 @@ def choose_tf():
         p,_ = ai_score(feats, regime) if AI_ENABLE else (1.0,0.0)
         if p>best_p:
             best, best_p, best_row = (tf, p, (df,z,regime,feats,session))
-    if best is None: 
+    if best is None:
         return None
     if _last_tf is not None and best != _last_tf:
-        df2 = fetch_mexc(_last_tf, limit=220)
-        if df2 is not None and len(df2)>=60:
+        df2 = fetch_mexc(_last_tf, limit=1000)
+        if df2 is not None and len(df2)>=30:
             df2 = compute_indicators(df2)
             z2 = df2.iloc[-1]
             regime2 = classify_regime(z2)

@@ -3,7 +3,10 @@ import os, threading, time
 from flask import Flask, request
 from telegram import Update, Bot
 from telegram.ext import Dispatcher, CommandHandler, CallbackContext
-from utils import scan_market, get_trade_logs, get_bot_status, get_results, check_data_source, record_trade, fetch_mexc, compute_indicators
+from utils import (
+    scan_market, get_trade_logs, get_bot_status, get_results, check_data_source,
+    record_trade, fetch_mexc, compute_indicators
+)
 
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER = os.getenv("OWNER_CHAT_ID")
@@ -21,7 +24,7 @@ def start(update: Update, ctx: CallbackContext):
     update.message.reply_text("🌀 SpiralAI online. Use /menu")
 
 def menu(update: Update, ctx: CallbackContext):
-    update.message.reply_text("🌀 Menu:\n/scan\n/forcescan\n/status\n/results\n/logs\n/check")
+    update.message.reply_text("🌀 Menu:\n/scan\n/forcescan\n/status\n/results\n/logs\n/check\n/diag")
 
 def scan_cmd(update: Update, ctx: CallbackContext):
     global active_trade
@@ -60,6 +63,17 @@ def logs_cmd(u,c):
     u.message.reply_text(msg[:4000])
 
 def check_cmd(u,c): u.message.reply_text(check_data_source())
+
+def diag_cmd(update, ctx):
+    out = []
+    for tf in ["1m","5m","15m","30m","1h"]:
+        df = fetch_mexc(tf, limit=200)
+        if df is None:
+            out.append(f"{tf}: None")
+        else:
+            last = df.index[-1].strftime("%Y-%m-%d %H:%M:%S")
+            out.append(f"{tf}: {len(df)} bars, last={last}")
+    update.message.reply_text("📡 MEXC diag\n" + "\n".join(out))
 
 # ---- momentum loop with BE/Trail & early-exit ----
 def _momentum_loop(trade):
@@ -153,6 +167,7 @@ dp.add_handler(CommandHandler("status", status_cmd))
 dp.add_handler(CommandHandler("results", results_cmd))
 dp.add_handler(CommandHandler("logs", logs_cmd))
 dp.add_handler(CommandHandler("check", check_cmd))
+dp.add_handler(CommandHandler("diag", diag_cmd))
 
 # Webhook
 @app.route(f"/{TOKEN}", methods=["POST"])
