@@ -153,9 +153,9 @@ def _now_str():
 # ---------- CORE MARKET OPS ----------
 def fetch_all():
     """Fetch 1m/5m/15m for BTCUSDT from MEXC."""
-    d1 = _mexc_klines(SYMBOL, "1m", 200)
-    d5 = _mexc_klines(SYMBOL, "5m", 200)
-    d15 = _mexc_klines(SYMBOL, "15m", 200)
+    d1 = _mexc_klines(SYMBOL, "1m", 500)
+    d5 = _mexc_klines(SYMBOL, "5m", 700)
+    d15 = _mexc_klines(SYMBOL, "15m", 300)
     return d1, d5, d15
 
 def compute_indicators(df: pd.DataFrame):
