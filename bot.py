@@ -93,6 +93,24 @@ dispatcher.add_handler(CommandHandler("logs", logs_command))
 dispatcher.add_handler(CommandHandler("backtest", backtest_command))
 dispatcher.add_handler(CommandHandler("ai", ai_command))
 
+# in bot.py after dispatcher setup:
+import threading, time
+from utils import momentum_pulse
+
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
+
+def _ping_loop(bot):
+    while True:
+        try:
+            msg = momentum_pulse()
+            if msg and OWNER_CHAT_ID:
+                bot.send_message(chat_id=OWNER_CHAT_ID, text=msg)
+        except Exception:
+            pass
+        time.sleep(60)
+
+threading.Thread(target=_ping_loop, args=(bot,), daemon=True).start()
+
 # webhook routes
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():

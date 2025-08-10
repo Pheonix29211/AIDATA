@@ -1,21 +1,19 @@
-import os, json, time, math, threading
-from datetime import datetime, timedelta, timezone
+# utils.py
+import os, json, time, math
+from datetime import datetime
+from typing import Optional, Tuple
 import requests
 import pandas as pd
 import numpy as np
 
-# ---------- ENV / CONFIG ----------
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT").upper()
-PRIMARY_TF = os.getenv("PRIMARY_TF", "5m").lower()          # "5m" default
-MOMENTUM_TF = os.getenv("MOMENTUM_TF", "1m").lower()        # ping on 1m
-FILTER_TF = os.getenv("FILTER_TF", "15m").lower()           # HTF filter
-AI_THRESHOLD = float(os.getenv("AI_THRESHOLD", "0.52"))     # gate to allow entries
-# ---- History limits (hard-coded) ----
-ONE_MIN_LIMIT      = 500   # used in /diag only
+# =========================
+# HARD-CODED HISTORY LIMITS
+# =========================
+ONE_MIN_LIMIT      = 500   # for diag & momentum checks
 FIVE_MIN_LIMIT     = 700   # ~2 days of 5m bars
 FIFTEEN_MIN_LIMIT  = 300   # ~2 days of 15m bars
-THIRTY_MIN_LIMIT   = 300   # optional, /diag
-ONE_HOUR_LIMIT     = 300   # optional, /diag
+THIRTY_MIN_LIMIT   = 300   # optional diag
+ONE_HOUR_LIMIT     = 300   # optional diag
 
 _LIMITS = {
     "1m":  ONE_MIN_LIMIT,
@@ -24,492 +22,540 @@ _LIMITS = {
     "30m": THIRTY_MIN_LIMIT,
     "1h":  ONE_HOUR_LIMIT,
 }
-SL_CAP_BASE = float(os.getenv("SL_CAP_BASE", "300"))
-SL_CAP_MAX  = float(os.getenv("SL_CAP_MAX", "500"))
-SL_CUSHION  = float(os.getenv("SL_CUSHION_DOLLARS", "50"))  # extra room if AI wants
 
-TP1_DOLLARS = float(os.getenv("TP1_DOLLARS", "600"))
-TP2_DOLLARS = float(os.getenv("TP2_DOLLARS", "1500"))
+# =========================
+# RISK / TP DEFAULTS (USD)
+# =========================
+SL_CAP_BASE         = float(os.getenv("SL_CAP_BASE", "300"))    # default SL budget
+SL_CAP_MAX          = float(os.getenv("SL_CAP_MAX",  "500"))    # maximum SL if AI expands
+SL_CUSHION_DOLLARS  = float(os.getenv("SL_CUSHION_DOLLARS", "50"))
+TP1_DOLLARS         = float(os.getenv("TP1_DOLLARS", "400"))
+TP2_DOLLARS         = float(os.getenv("TP2_DOLLARS", "1200"))
 
-PING_INTERVAL_SEC = int(os.getenv("PING_INTERVAL_SEC", "60"))
-TZ = timezone(timedelta(hours=5, minutes=30))  # Asia/Kolkata
+# AI gate for entries
+AI_MIN_SCORE        = float(os.getenv("AI_MIN_SCORE", "0.52"))
 
-OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")     # for background pings
+# RSI gate enabled?
+USE_RSI             = os.getenv("USE_RSI", "true").lower() == "true"
+RSI_MIN             = int(os.getenv("RSI_MIN", "25"))
+RSI_MAX             = int(os.getenv("RSI_MAX", "75"))
 
-# Files
-LOG_FILE_CANDIDATES = ["trade_logs.json", "trades.json"]
-def _resolve_log_path():
-    for p in LOG_FILE_CANDIDATES:
-        if os.path.exists(p):
-            return p
-    return LOG_FILE_CANDIDATES[0]
-LOG_FILE = _resolve_log_path()
-if not os.path.exists(LOG_FILE):
-    with open(LOG_FILE, "w") as f:
-        f.write("[]")
+# Data / logs / tz
+SYMBOL              = os.getenv("SYMBOL", "BTCUSDT")
+TRADE_LOG_FILE      = os.getenv("TRADE_LOG_FILE", "trade_logs.json")
+OPEN_TRADE_FILE     = os.getenv("OPEN_TRADE_FILE", "open_trade.json")   # new file to store current open idea
+TZ                  = os.getenv("TZ_NAME", "Asia/Kolkata")
 
-# AI
+# Momentum ping cadence (bot side can call momentum_pulse() every ~60s)
+PING_COOLDOWN_SEC_1M = 50
+PING_COOLDOWN_SEC_5M = 50
+
+# =========================
+# Try to wire ai_core (dopamine & adaptation)
+# =========================
+def _noop_reward(**kwargs): return 0.0
+def _noop_register(_): pass
+def _fallback_ai_score(features: dict, regime: str):
+    # simple, stable scorer
+    spread = features.get("ema_spread", 0.0)   # (ema5-ema20)/close
+    slope  = features.get("ema_slope", 0.0)    # ema20 slope normalized
+    base   = 0.55 + 0.10 * np.clip(spread, -0.1, 0.1) + 0.05 * np.clip(slope, -0.1, 0.1)
+    return max(0.0, min(1.0, float(base))), 0.05
+
 try:
-    from ai_core import compute_reward, online_update, register_outcome
-    _AI_OK = True
+    from ai_core import score as ai_score_model, compute_reward, register_outcome
 except Exception:
-    _AI_OK = False
+    ai_score_model = _fallback_ai_score
+    compute_reward = _noop_reward
+    register_outcome = _noop_register
 
-# In-memory active trade
-_ACTIVE = None           # dict with keys: side, entry, sl, tp1, tp2, ts, expanded, tp1_hit
-_LAST_PING = 0.0
-_LOCK = threading.Lock()
+# =========================
+# MEXC v3 spot klines fetch
+# =========================
+MEXC_V3_URL = "https://api.mexc.com/api/v3/klines"
+_MEXC_TF_MAP = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m","1h":"1h"}
 
-# ---------- HELPERS ----------
-def _mexc_klines(symbol: str, interval: str, limit: int = 200):
+def mexc_fetch(tf: str, limit: int = 200) -> Optional[pd.DataFrame]:
     """
-    MEXC v3 klines (spot). Some regions return 12 columns (Binance-style),
-    others return 8 columns. Parse both and normalize to the columns we need.
+    Robust MEXC v3 klines fetcher (spot). Returns DataFrame with:
+    index = open_time (Asia/Kolkata), columns = open, high, low, close, volume
+    Handles 8–12 column array responses.
     """
-    url = "https://api.mexc.com/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=12)
-    if r.status_code != 200:
-        raise RuntimeError(f"MEXC {interval} {r.status_code} | {url}")
-
-    data = r.json()
-    if not isinstance(data, list) or not data:
-        raise RuntimeError(f"MEXC {interval} returned no list")
-
-    # Build a DataFrame from raw rows (variable-length)
-    df_raw = pd.DataFrame(data)
-
-    # 12-col layout: 0..11
-    #  0 open_time(ms),1 open,2 high,3 low,4 close,5 volume,
-    #  6 close_time(ms),7 quote_vol,8 trades,9 buy_base,10 buy_quote,11 ignore
-    # 8-col layout (observed in your region): 0..7
-    #  0 open_time(ms),1 open,2 high,3 low,4 close,5 volume,
-    #  6 close_time(ms),7 quote_vol
-
-    # Map common fields safely (present in both)
-    colmap = {
-        0: "open_time", 1: "open", 2: "high", 3: "low",
-        4: "close", 5: "volume", 6: "close_time", 7: "quote_asset_vol"
-    }
-    # Extra (only if 12 columns exist)
-    extra_map = {8: "trades", 9: "buy_base", 10: "buy_quote", 11: "ignore"}
-
-    # Rename what exists
-    rename_dict = {}
-    for i, name in colmap.items():
-        if i in df_raw.columns:
-            rename_dict[i] = name
-    for i, name in extra_map.items():
-        if i in df_raw.columns:
-            rename_dict[i] = name
-
-    df = df_raw.rename(columns=rename_dict)
-
-    # Keep only the fields we actually use downstream
-    needed = ["open_time", "open", "high", "low", "close", "volume"]
-    missing = [c for c in needed if c not in df.columns]
-    if missing:
-        raise RuntimeError(f"MEXC {interval} unsupported layout (missing {missing}); got {len(df_raw.columns)} columns")
-
-    # Type conversions
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms").dt.tz_localize("UTC").dt.tz_convert(TZ)
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df = df[["open_time", "open", "high", "low", "close", "volume"]].dropna()
-    df = df.set_index("open_time")
-    return df
-
-def _vwap(df: pd.DataFrame):
-    pv = (df["close"] * df["volume"]).cumsum()
-    vv = df["volume"].cumsum().replace(0, np.nan)
-    return pv / vv
-
-def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
-
-def _regime(df5: pd.DataFrame):
-    """rough trend/range read from 5m."""
-    ema9 = _ema(df5["close"], 9)
-    ema21 = _ema(df5["close"], 21)
-    spread = (ema9 - ema21).iloc[-1]
-    atr = (df5["high"] - df5["low"]).rolling(14).mean().iloc[-1]
-    choppy = (abs(spread) < atr*0.15)
-    return ("range" if choppy else "trend"), float(spread)
-
-def _ai_score(features: dict, regime: str):
-    """Light proxy when ai_core not available."""
-    if _AI_OK:
-        # ai_core.score returns (p, exploration) in previous iterations,
-        # but we only have reward/update/register here.
-        # So derive a simple p from features:
-        pass
-    # Simple fallback: normalized ema_spread + slope
-    p = 0.5 + 0.2*features.get("ema_spread", 0.0) + 0.05*features.get("ema_slope", 0.0)
-    return max(0.0, min(1.0, p))
-
-def _load_logs():
     try:
-        with open(LOG_FILE, "r") as f:
-            return json.load(f)
+        iv = _MEXC_TF_MAP.get(tf, tf)
+        params = {"symbol": SYMBOL, "interval": iv, "limit": int(limit)}
+        r = requests.get(MEXC_V3_URL, params=params, timeout=12)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, list) or len(data) == 0:
+            return None
+
+        cols_full = [
+            "open_time","open","high","low","close","volume",
+            "close_time","quote_volume","trade_count",
+            "taker_buy_base","taker_buy_quote","ignore"
+        ]
+        n = len(data[0])
+        df = pd.DataFrame(data, columns=cols_full[:n])
+
+        for c in ("open","high","low","close","volume"):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        if "open_time" in df.columns:
+            idx = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.tz_convert(TZ)
+            df.index = idx
+
+        df = df[["open","high","low","close","volume"]].dropna()
+        return df
+    except Exception:
+        return None
+
+# =========================
+# INDICATORS & HELPERS
+# =========================
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    d["ema5"]  = d["close"].ewm(span=5,  adjust=False).mean()
+    d["ema20"] = d["close"].ewm(span=20, adjust=False).mean()
+    vv = d["volume"].replace(0, np.nan)
+    d["vwap"] = (d["close"] * d["volume"]).cumsum() / vv.cumsum()
+    # RSI(14)
+    delta = d["close"].diff()
+    gain  = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    d["rsi"] = 100 - 100/(1 + rs)
+    return d
+
+def htf_trend(df15: pd.DataFrame) -> str:
+    d = compute_indicators(df15)
+    if len(d) < 20:
+        return "range"
+    return "up" if d["close"].iloc[-1] > d["ema20"].iloc[-1] else "down"
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+# =========================
+# OPEN TRADE STATE (persist to file)
+# =========================
+def _load_open() -> Optional[dict]:
+    try:
+        if not os.path.exists(OPEN_TRADE_FILE):
+            return None
+        x = json.load(open(OPEN_TRADE_FILE, "r"))
+        return x if isinstance(x, dict) else None
+    except Exception:
+        return None
+
+def _save_open(d: Optional[dict]):
+    try:
+        if d is None:
+            if os.path.exists(OPEN_TRADE_FILE):
+                os.remove(OPEN_TRADE_FILE)
+            return
+        json.dump(d, open(OPEN_TRADE_FILE, "w"))
+    except Exception:
+        pass
+
+def _load_logs() -> list:
+    try:
+        if not os.path.exists(TRADE_LOG_FILE):
+            return []
+        data = json.load(open(TRADE_LOG_FILE, "r"))
+        return data if isinstance(data, list) else []
     except Exception:
         return []
 
-def _save_logs(rows):
-    with open(LOG_FILE, "w") as f:
-        json.dump(rows, f, ensure_ascii=False)
+def _save_logs(rows: list):
+    try:
+        json.dump(rows, open(TRADE_LOG_FILE, "w"))
+    except Exception:
+        pass
 
-def _now_str():
-    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
-
-# ---------- CORE MARKET OPS ----------
-def fetch_all():
-    """Fetch 1m/5m/15m for BTCUSDT from MEXC."""
-    d1 = _mexc_klines(SYMBOL, "1m", 500)
-    d5 = _mexc_klines(SYMBOL, "5m", 700)
-    d15 = _mexc_klines(SYMBOL, "15m", 300)
-    return d1, d5, d15
-
-def compute_indicators(df: pd.DataFrame):
-    out = df.copy()
-    out["ema9"]  = _ema(out["close"], 9)
-    out["ema21"] = _ema(out["close"], 21)
-    out["vwap"]  = _vwap(out)
-    out["rsi"]   = ta_rsi(out["close"], 14)
-    return out
-
-def ta_rsi(series, length=14):
-    delta = series.diff()
-    up = delta.clip(lower=0.0)
-    down = -1*delta.clip(upper=0.0)
-    ma_up = up.ewm(com=length-1, adjust=False).mean()
-    ma_down = down.ewm(com=length-1, adjust=False).mean()
-    rs = ma_up / ma_down.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-# ---------- SIGNAL / ENTRY ----------
-def _build_signal(d5: pd.DataFrame, d15: pd.DataFrame):
-    """Return (side, entry, sl, tp1, tp2, score, details) or (None, ...)"""
-    # indicators
-    d5i = compute_indicators(d5)
-    d15i = compute_indicators(d15)
-
-    c5  = float(d5i["close"].iloc[-1])
-    e9  = float(d5i["ema9"].iloc[-1])
-    e21 = float(d5i["ema21"].iloc[-1])
-    vw5 = float(d5i["vwap"].iloc[-1])
-    rsi = float(d5i["rsi"].iloc[-1])
-
-    e9slope = float((d5i["ema9"].iloc[-1] - d5i["ema9"].iloc[-4]) / max(1e-6, d5i["ema9"].iloc[-4]))
-    spread = (e9 - e21) / max(1e-6, c5)
-
-    # HTF filter (15m)
-    c15  = float(d15i["close"].iloc[-1])
-    vw15 = float(d15i["vwap"].iloc[-1])
-    htf_ok_long  = (c15 > vw15)
-    htf_ok_short = (c15 < vw15)
-
-    features = {"ema_spread": spread, "ema_slope": e9slope}
-    regime, reg_spread = _regime(d5)
-    score = _ai_score(features, regime)
-
-    # Base side from 5m:
-    want_long  = (c5 > vw5 and e9 > e21 and rsi > 45)
-    want_short = (c5 < vw5 and e9 < e21 and rsi < 55)
-
-    side = None
-    if want_long and htf_ok_long and score >= AI_THRESHOLD:
-        side = "LONG"
-    elif want_short and htf_ok_short and score >= AI_THRESHOLD:
-        side = "SHORT"
-
-    if not side:
-        return None, None, None, None, None, score, f"TF 5m | Regime {regime}"
-
-    # Price-based $ SL/TP
-    if side == "LONG":
-        entry = c5
-        sl    = entry - min(SL_CAP_MAX, SL_CAP_BASE + SL_CUSHION)
-        tp1   = entry + TP1_DOLLARS
-        tp2   = entry + TP2_DOLLARS
-    else:
-        entry = c5
-        sl    = entry + min(SL_CAP_MAX, SL_CAP_BASE + SL_CUSHION)
-        tp1   = entry - TP1_DOLLARS
-        tp2   = entry - TP2_DOLLARS
-
-    details = f"TF 5m | Regime {regime}"
-    return side, entry, sl, tp1, tp2, score, details
-
-def record_trade(trade: dict):
+def record_trade(entry: dict) -> None:
     rows = _load_logs()
-    rows.append(trade)
+    rows.append(entry)
     _save_logs(rows)
 
-def scan_market():
-    """Used by /scan and /forcescan. Also used by auto background."""
+# =========================
+# ENTRY FORMATTER
+# =========================
+def _fmt_signal(side: str, px: float, sl: float, tp1: float, tp2: float, src="MEXC") -> str:
+    arrow = "🟢 LONG" if side == "long" else "🔴 SHORT"
+    return f"{arrow} @ {px:.0f} | SL {sl:.0f} TP {tp1:.0f}→{tp2:.0f} [{src}]"
+
+# =========================
+# LIVE SCAN (used by /scan and /forcescan)
+# =========================
+def scan_market() -> Tuple[str, bool]:
+    # Block if there’s already an open trade
+    open_pos = _load_open()
+    if open_pos is not None:
+        side = open_pos.get("side","").upper()
+        e = open_pos.get("entry", 0)
+        return (f"ℹ️ Existing trade open: {side} @ {e}. No new entry.", False)
+
+    df5  = mexc_fetch("5m",  limit=FIVE_MIN_LIMIT)
+    df15 = mexc_fetch("15m", limit=FIFTEEN_MIN_LIMIT)
+    if df5 is None or df5.empty or df15 is None or df15.empty:
+        return ("❌ Data Error:\nNo data from MEXC.", False)
+
+    d5  = compute_indicators(df5)
+    d15 = compute_indicators(df15)
+    regime = htf_trend(d15)
+    if regime == "range":
+        return ("ℹ️ No trade | TF 5m | Regime range", False)
+
+    last5 = d5.iloc[-1]
+    close = float(last5["close"])
+
+    # regime gate
+    if regime == "up":
+        cond = (last5["close"] > last5["vwap"]) and (last5["ema5"] > last5["ema20"])
+        side = "long"
+    else:
+        cond = (last5["close"] < last5["vwap"]) and (last5["ema5"] < last5["ema20"])
+        side = "short"
+
+    # rsi gate
+    if USE_RSI:
+        rsi_ok = RSI_MIN <= float(last5["rsi"]) <= RSI_MAX
+        if not rsi_ok:
+            return (f"ℹ️ No trade | TF 5m | Regime {regime} | RSI gate", False)
+
+    # AI score (use ai_core.score if available)
+    ema_spread = (float(last5["ema5"]) - float(last5["ema20"])) / max(1.0, close)
+    ema20_slope = (d5["ema20"].iloc[-1] - d5["ema20"].iloc[-5]) / max(1.0, 4.0*close)
+    p, _explore = ai_score_model({"ema_spread": ema_spread, "ema_slope": ema20_slope}, regime)
+    if (not cond) or (p < AI_MIN_SCORE):
+        return (f"ℹ️ No trade | TF 5m | Regime {regime} | AI {p:.2f}", False)
+
+    # Create trade levels
+    if side == "long":
+        sl  = close - SL_CAP_BASE
+        tp1 = close + TP1_DOLLARS
+        tp2 = close + TP2_DOLLARS
+    else:
+        sl  = close + SL_CAP_BASE
+        tp1 = close - TP1_DOLLARS
+        tp2 = close - TP2_DOLLARS
+
+    # Persist open trade
+    open_pos = {
+        "symbol": SYMBOL,
+        "source": "MEXC",
+        "side": side,
+        "entry": float(close),
+        "sl": float(sl),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "breakeven": False,          # becomes True after TP1 is tagged
+        "opened_at": _now_iso(),
+        "last_ping_1m": 0,
+        "last_ping_5m": 0
+    }
+    _save_open(open_pos)
+
+    # Log creation in trade logs (OPEN)
+    record_trade({
+        "time": _now_iso(),
+        "side": side,
+        "price": float(close),
+        "sl": float(sl),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "outcome": "OPEN",
+        "source": "entry"
+    })
+
+    msg = _fmt_signal(side, close, sl, tp1, tp2, "MEXC") + f"\n🤖 AI={p:.2f} | Regime={regime}"
+    return (msg, True)
+
+# =========================
+# MOMENTUM EVALUATION & MANAGEMENT
+# =========================
+def _current_price_1m() -> Optional[float]:
+    d1 = mexc_fetch("1m", limit=2)
+    if d1 is None or d1.empty: return None
+    return float(d1["close"].iloc[-1])
+
+def _momentum_view(tf: str) -> Optional[str]:
+    df = mexc_fetch(tf, limit=ONE_MIN_LIMIT if tf=="1m" else (FIVE_MIN_LIMIT if tf=="5m" else 200))
+    if df is None or df.empty: return None
+    d = compute_indicators(df)
+    last = d.iloc[-1]
+    up   = (last["close"] > last["vwap"]) and (last["ema5"] > last["ema20"]) and (float(last["rsi"]) >= 50.0)
+    down = (last["close"] < last["vwap"]) and (last["ema5"] < last["ema20"]) and (float(last["rsi"]) <= 50.0)
+    if up: return "up"
+    if down: return "down"
+    return "mixed"
+
+def _close_trade(outcome: str, px: float):
+    # write outcome to logs & clear open file; reward the AI
+    rows = _load_logs()
+    # find last OPEN to close
+    idx = None
+    for i in range(len(rows)-1, -1, -1):
+        if rows[i].get("outcome") == "OPEN":
+            idx = i
+            break
+    if idx is not None:
+        rows[idx]["outcome"] = outcome
+        rows[idx]["exit_price"] = float(px)
+        rows[idx]["exit_time"]  = _now_iso()
+        _save_logs(rows)
+
+    # Register outcome to AI (best-effort; we don’t have all metrics here → simple reward)
     try:
-        d1, d5, d15 = fetch_all()
-    except Exception as e:
-        return f"❌ Data Error:\n{str(e)}", "ERR"
+        pnl = 0.0
+        if idx is not None:
+            ent = float(rows[idx].get("price", px))
+            pnl = (px - ent) if rows[idx].get("side")=="long" else (ent - px)
+        reward = compute_reward(
+            outcome=outcome, pnl=pnl, bars_to_exit=0,
+            tp2_hit=(outcome=="TP2"), tp1_hit=(outcome in ("TP1","TP2")),
+            sl_expanded=False, sl_dollars=SL_CAP_BASE, sl_cap_base=SL_CAP_BASE,
+            trailing_respected=True, momentum_aligned_bars=0, duplicate_entry=False
+        )
+        register_outcome(outcome)
+    except Exception:
+        pass
 
-    side, entry, sl, tp1, tp2, score, details = _build_signal(d5, d15)
-    if not side:
-        return f"ℹ️ No trade | {details} | AI {score:.2f}", "NONE"
+    _save_open(None)
 
-    with _LOCK:
-        global _ACTIVE
-        if _ACTIVE is not None:
-            return "ℹ️ Already in a trade; skipping new signal.", "HOLD"
-
-        _ACTIVE = {
-            "ts": _now_str(),
-            "symbol": SYMBOL,
-            "side": side,
-            "entry": float(entry),
-            "sl": float(sl),
-            "tp1": float(tp1),
-            "tp2": float(tp2),
-            "expanded": False,
-            "tp1_hit": False
-        }
-        record_trade({"event": "OPEN", **_ACTIVE})
-
-    msg = (f"{'🟢' if side=='LONG' else '🔴'} {side} @ {entry:.2f} | "
-           f"SL {sl:.2f} TP {tp1:.2f}→{tp2:.2f} [MEXC]\n"
-           f"Score {score:.2f} | {details}")
-    return msg, "OPEN"
-
-# ---------- MANAGER / PINGS ----------
-def _check_close(px: float):
-    """Return outcome or None; apply AI reward/update if closing."""
-    with _LOCK:
-        global _ACTIVE
-        a = _ACTIVE
-        if a is None:
-            return None
-
-        side = a["side"]
-        entry, sl, tp1, tp2 = a["entry"], a["sl"], a["tp1"], a["tp2"]
-
-        # TP1
-        if side == "LONG" and px >= tp1 and not a.get("tp1_hit"):
-            a["tp1_hit"] = True
-            record_trade({"event":"TP1", "ts":_now_str(), "px":px})
-            return "TP1"
-
-        if side == "SHORT" and px <= tp1 and not a.get("tp1_hit"):
-            a["tp1_hit"] = True
-            record_trade({"event":"TP1", "ts":_now_str(), "px":px})
-            return "TP1"
-
-        # TP2 / SL
-        outcome = None
-        if side == "LONG" and px >= tp2:
-            outcome = "TP2"
-        elif side == "SHORT" and px <= tp2:
-            outcome = "TP2"
-        elif side == "LONG" and px <= sl:
-            outcome = "SL"
-        elif side == "SHORT" and px >= sl:
-            outcome = "SL"
-
-        if outcome:
-            # AI reward + update
-            if _AI_OK:
-                pnl = (px - entry) if side == "LONG" else (entry - px)
-                reward = compute_reward(
-                    outcome=outcome, pnl=float(pnl),
-                    bars_to_exit=0,
-                    tp2_hit=(outcome == "TP2"),
-                    tp1_hit=(a.get("tp1_hit", False)),
-                    sl_expanded=bool(a.get("expanded", False)),
-                    sl_dollars=abs(entry - sl),
-                    sl_cap_base=SL_CAP_BASE,
-                    trailing_respected=bool(a.get("tp1_hit", False)),
-                    momentum_aligned_bars=0,
-                    duplicate_entry=False
-                )
-                feat = {"ema_spread": abs(entry - sl)/max(1.0, entry), "ema_slope": 0.0}
-                regime = "trend"
-                try:
-                    online_update(feat, regime, reward)
-                    register_outcome(outcome)
-                except Exception:
-                    pass
-
-            record_trade({"event": outcome, "ts": _now_str(), "px": px})
-            _ACTIVE = None
-            return outcome
-
+def momentum_pulse() -> Optional[str]:
+    """
+    Call this every ~60s from your bot background thread.
+    - Moves SL→BE after TP1
+    - Suggests early book on weakness
+    - Encourages hold on strength
+    - Closes trade when SL/TP is tagged, logs outcome and notifies
+    Returns a short message (or None if no ping).
+    """
+    pos = _load_open()
+    if pos is None:
         return None
 
-def _latest_close(tf="1m"):
-    df = _mexc_klines(SYMBOL, tf, limit=2)
-    return float(df["close"].iloc[-1])
+    now = time.time()
+    side = pos["side"]
+    entry = float(pos["entry"])
+    sl   = float(pos["sl"])
+    tp1  = float(pos["tp1"])
+    tp2  = float(pos["tp2"])
+    breakeven = bool(pos.get("breakeven", False))
 
-def start_background(bot):
-    """Kick off momentum pings + exit manager loop."""
-    def runner():
-        global _LAST_PING
-        while True:
-            time.sleep(PING_INTERVAL_SEC)
-            try:
-                px = _latest_close("1m")
-                outcome = _check_close(px)
-                # momentum ping if still open
-                with _LOCK:
-                    a = _ACTIVE
-                if OWNER_CHAT_ID and a is not None:
-                    # 5m trend read for context
-                    d5 = _mexc_klines(SYMBOL, "5m", 50)
-                    d5i = compute_indicators(d5)
-                    e9 = float(d5i["ema9"].iloc[-1]); e21=float(d5i["ema21"].iloc[-1])
-                    vw = float(d5i["vwap"].iloc[-1])
-                    trend = "↑" if (e9>e21 and d5i['close'].iloc[-1]>vw) else ("↓" if (e9<e21 and d5i['close'].iloc[-1]<vw) else "≈")
-                    bot.send_message(
-                        chat_id=OWNER_CHAT_ID,
-                        text=(f"⏱️ Momentum ping\n"
-                              f"{a['side']} @ {a['entry']:.2f} | px {px:.2f}\n"
-                              f"SL {a['sl']:.2f} TP {a['tp1']:.2f}/{a['tp2']:.2f}\n"
-                              f"5m trend: {trend}")
-                    )
-                if OWNER_CHAT_ID and outcome in ("TP1","TP2","SL"):
-                    bot.send_message(chat_id=OWNER_CHAT_ID, text=f"✅ Close: {outcome}")
-            except Exception:
-                # swallow and continue
-                pass
+    # latest 1m price and candle HL for tag checks
+    d1 = mexc_fetch("1m", limit=2)
+    if d1 is None or d1.empty:
+        return None
+    last = d1.iloc[-1]
+    price = float(last["close"])
+    high  = float(last["high"])
+    low   = float(last["low"])
 
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
+    # Check TP/SL tags first (realized outcomes)
+    if side == "long":
+        if high >= tp2:
+            _close_trade("TP2", tp2)
+            return f"🏁 TP2 HIT @ {tp2:.0f} — trade closed."
+        if high >= tp1 and not breakeven:
+            pos["breakeven"] = True
+            pos["sl"] = entry  # move to BE
+            _save_open(pos)
+            return f"🔒 Moved SL → BE @ {entry:.0f} (TP1 tagged)."
+        if low <= sl:
+            _close_trade("SL", sl)
+            return f"🛑 SL HIT @ {sl:.0f} — trade closed."
+    else:  # short
+        if low <= tp2:
+            _close_trade("TP2", tp2)
+            return f"🏁 TP2 HIT @ {tp2:.0f} — trade closed."
+        if low <= tp1 and not breakeven:
+            pos["breakeven"] = True
+            pos["sl"] = entry
+            _save_open(pos)
+            return f"🔒 Moved SL → BE @ {entry:.0f} (TP1 tagged)."
+        if high >= sl:
+            _close_trade("SL", sl)
+            return f"🛑 SL HIT @ {sl:.0f} — trade closed."
 
-# ---------- PUBLIC API FOR BOT ----------
-def diag_data():
-    lines = []
-    for tf in ["1m", "5m", "15m", "30m", "1h"]:
+    # Momentum view (1m & 5m)
+    v1 = _momentum_view("1m")
+    v5 = _momentum_view("5m")
+
+    # Respect ping cooldowns
+    out_msgs = []
+    last1 = float(pos.get("last_ping_1m", 0))
+    last5 = float(pos.get("last_ping_5m", 0))
+
+    # Construct strength/weakness relative to side
+    def _favor(view: Optional[str]) -> Optional[str]:
+        if view is None: return None
+        if side == "long":
+            if view == "up": return "favor"
+            if view == "down": return "against"
+            return "mixed"
+        else:
+            if view == "down": return "favor"
+            if view == "up":   return "against"
+            return "mixed"
+
+    f1 = _favor(v1)
+    f5 = _favor(v5)
+
+    # Weakness → suggest early book (only after some profit over BE)
+    up_pnl = (price - entry) if side == "long" else (entry - price)
+    small_gain = up_pnl >= 100.0  # at least +$100 before nagging
+    if (f1 == "against" or f5 == "against") and small_gain:
+        if now - last1 > PING_COOLDOWN_SEC_1M:
+            out_msgs.append("⚠️ Momentum weakening — consider **booking partial**.")
+            pos["last_ping_1m"] = now
+
+    # Strength → hold guidance toward TP2
+    if (f1 == "favor" or f5 == "favor") and up_pnl >= 50.0:
+        if now - last5 > PING_COOLDOWN_SEC_5M:
+            out_msgs.append("🏎️ Momentum strong — **hold toward TP2**.")
+            pos["last_ping_5m"] = now
+
+    if out_msgs:
+        _save_open(pos)
+        return "\n".join(out_msgs)
+
+    return None
+
+# =========================
+# BACKTEST (2 days default)
+# =========================
+def run_backtest(days: int = 2) -> str:
+    try:
+        df5  = mexc_fetch("5m",  limit=FIVE_MIN_LIMIT)
+        df15 = mexc_fetch("15m", limit=FIFTEEN_MIN_LIMIT)
+        if df5 is None or df5.empty or df15 is None or df15.empty:
+            return "🧪 Backtest (2d, 5m): 0 entries | Wins 0 | TP2 0 | SL 0\n(no qualifying entries)"
+
+        end = df5.index[-1]
+        start = end - pd.Timedelta(days=days)
+        d5  = compute_indicators(df5.loc[df5.index >= start])
+        d15 = compute_indicators(df15.loc[df15.index >= (end - pd.Timedelta(days=days*2))])
+        if len(d5) < 40:
+            return "🧪 Backtest (2d, 5m): 0 entries | Wins 0 | TP2 0 | SL 0\n(no qualifying entries)"
+
+        regime = htf_trend(d15)
+        if regime == "range":
+            return "🧪 Backtest (2d, 5m): 0 entries | Wins 0 | TP2 0 | SL 0\n(no qualifying entries)"
+
+        entries=wins=tp2hits=sls=0
+        lines=[]
+        for i in range(25, len(d5)-1):
+            row = d5.iloc[i]
+            close = float(row["close"])
+            if USE_RSI and not (RSI_MIN <= float(row["rsi"]) <= RSI_MAX):
+                continue
+
+            if regime == "up":
+                cond = (row["close"] > row["vwap"]) and (row["ema5"] > row["ema20"])
+                side = "long"
+            else:
+                cond = (row["close"] < row["vwap"]) and (row["ema5"] < row["ema20"])
+                side = "short"
+
+            ema_spread = (float(row["ema5"]) - float(row["ema20"])) / max(1.0, close)
+            ema20_slope = (d5["ema20"].iloc[i] - d5["ema20"].iloc[i-4]) / max(1.0, 4.0*close)
+            p,_ = ai_score_model({"ema_spread": ema_spread, "ema_slope": ema20_slope}, regime)
+            if (not cond) or p < AI_MIN_SCORE:
+                continue
+
+            entries += 1
+            if side=="long":
+                sl  = close - SL_CAP_BASE
+                tp1 = close + TP1_DOLLARS
+                tp2 = close + TP2_DOLLARS
+                fwd = d5.iloc[i+1:i+60].copy()
+                hit_tp2 = (fwd["high"] >= tp2).any()
+                hit_tp1 = (fwd["high"] >= tp1).any()
+                # breakeven after TP1
+                hit_sl  = (fwd["low"] <= (close if hit_tp1 else sl)).any()
+            else:
+                sl  = close + SL_CAP_BASE
+                tp1 = close - TP1_DOLLARS
+                tp2 = close - TP2_DOLLARS
+                fwd = d5.iloc[i+1:i+60].copy()
+                hit_tp2 = (fwd["low"] <= tp2).any()
+                hit_tp1 = (fwd["low"] <= tp1).any()
+                hit_sl  = (fwd["high"] >= (close if hit_tp1 else sl)).any()
+
+            outcome="OPEN"
+            if hit_sl:
+                outcome="SL"; sls+=1
+            elif hit_tp2:
+                outcome="TP2"; tp2hits+=1; wins+=1
+            elif hit_tp1:
+                outcome="TP1"; wins+=1
+
+            if len(lines)<40:
+                lines.append(f"{entries:02d}. {side.upper()} @ {close:.0f} → {outcome}")
+
+        if entries==0:
+            return "🧪 Backtest (2d, 5m): 0 entries | Wins 0 | TP2 0 | SL 0\n(no qualifying entries)"
+        head = f"🧪 Backtest (2d, 5m): {entries} entries | Wins {wins} | TP2 {tp2hits} | SL {sls}"
+        return head + ("\n" + "\n".join(lines) if lines else "")
+    except Exception as e:
+        return f"❌ Backtest error: {e}"
+
+# =========================
+# DIAG / STATUS / RESULTS / LOGS
+# =========================
+def diag_data() -> str:
+    lines=[]
+    for tf, lim in [("1m", ONE_MIN_LIMIT), ("5m", FIVE_MIN_LIMIT),
+                    ("15m", FIFTEEN_MIN_LIMIT), ("30m", THIRTY_MIN_LIMIT),
+                    ("1h", ONE_HOUR_LIMIT)]:
         try:
-            df = mexc_fetch(tf, limit=_LIMITS.get(tf, 200))   # <-- important
+            df = mexc_fetch(tf, limit=lim)
             if df is not None and not df.empty:
-                last_ts = str(df.index[-1])
-                lines.append(f"{tf}: {len(df)} bars, last={last_ts}")
+                lines.append(f"{tf}: {len(df)} bars, last={df.index[-1]}")
             else:
                 lines.append(f"{tf}: None")
         except Exception as e:
             lines.append(f"{tf}: error {e}")
     return "📡 MEXC diag\n" + "\n".join(lines)
 
-def get_bot_status():
-    with _LOCK:
-        a = _ACTIVE
-    openline = "none" if a is None else f"{a['side']} @ {a['entry']:.2f} (SL {a['sl']:.2f}, TP {a['tp1']:.2f}/{a['tp2']:.2f})"
-    return (f"📊 Current Logic:\n"
-            f"- Exchange: MEXC, Symbol: {SYMBOL}\n"
-            f"- Entry TF: {PRIMARY_TF}, HTF filter: {FILTER_TF}\n"
-            f"- VWAP/EMA + RSI gate, AI≥{AI_THRESHOLD}\n"
-            f"- $SL cap {SL_CAP_BASE}→{SL_CAP_MAX} (cushion {SL_CUSHION})\n"
-            f"- $TPs {TP1_DOLLARS}/{TP2_DOLLARS}\n"
-            f"- Momentum ping: every {PING_INTERVAL_SEC}s\n"
-            f"- Open: {openline}")
+def get_bot_status() -> str:
+    open_pos = _load_open()
+    open_line = "none" if open_pos is None else f'{open_pos.get("side","").upper()} @ {open_pos.get("entry")}'
+    return (
+        "📊 Current Logic:\n"
+        f"- Exchange: MEXC, Symbol: {SYMBOL}\n"
+        "- Entry TF: 5m, HTF filter: 15m\n"
+        f"- VWAP/EMA + {'RSI ' if USE_RSI else ''}AI≥{AI_MIN_SCORE:.2f}\n"
+        f"- $SL cap {SL_CAP_BASE:.1f}→{SL_CAP_MAX:.1f} (cushion {SL_CUSHION_DOLLARS:.1f})\n"
+        f"- $TPs {TP1_DOLLARS:.1f}/{TP2_DOLLARS:.1f}\n"
+        "- Momentum ping: every 60s (1m & 5m)\n"
+        f"- Open: {open_line}"
+    )
 
-def get_results():
+def get_trade_logs(n: int = 30) -> str:
     rows = _load_logs()
-    wins = sum(1 for r in rows if r.get("event") in ("TP1","TP2"))
-    tp2  = sum(1 for r in rows if r.get("event") == "TP2")
-    sls  = sum(1 for r in rows if r.get("event") == "SL")
-    return f"📈 Results: wins {wins} | TP2 {tp2} | SL {sls} | total events {len(rows)}"
-
-def get_trade_logs(limit=30):
-    rows = _load_logs()
-    view = rows[-limit:]
-    parts = []
-    for r in view:
-        if r.get("event") == "OPEN":
-            parts.append(f"OPEN {r.get('side')} @ {r.get('entry'):.2f} (SL {r.get('sl'):.2f}, TP {r.get('tp1'):.2f}/{r.get('tp2'):.2f}) {r.get('ts')}")
-        else:
-            parts.append(f"{r.get('event')} {r.get('px', '')} {r.get('ts')}")
-    return "🧾 Last trades:\n" + "\n".join(parts)
-
-def run_backtest(days=2):
-    # 5m bars for last N days
-    lim = int((days*24*60)/5) + 10
-   df5  = mexc_fetch("5m",  limit=FIVE_MIN_LIMIT)     # was 200 or missing
-df15 = mexc_fetch("15m", limit=FIFTEEN_MIN_LIMIT)  # was 200 or missing
-    d5i = compute_indicators(d5)
-    d15i = compute_indicators(d15)
-
-    def htf_ok(idx5):
-        t = d5i.index[idx5]
-        # nearest 15m <= t
-        t15 = d15i.index[d15i.index.get_indexer([t], method="pad")[0]]
-        c15 = float(d15i.loc[t15, "close"])
-        vw15= float(d15i.loc[t15, "vwap"])
-        return (c15 > vw15, c15 < vw15)
-
-    wins=tp2=sl=0
-    entries=0
-    openpos=None
+    if not rows:
+        return "No trades yet."
     lines=[]
-    for i in range(25, len(d5i)):
-        c = float(d5i["close"].iloc[i]); e9=float(d5i["ema9"].iloc[i]); e21=float(d5i["ema21"].iloc[i])
-        vw=float(d5i["vwap"].iloc[i]); rsi=float(d5i["rsi"].iloc[i])
-        sp = (e9 - e21) / max(1e-6, c)
-        slope = (d5i["ema9"].iloc[i] - d5i["ema9"].iloc[i-3]) / max(1e-6, d5i["ema9"].iloc[i-3])
-        # AI score proxy
-        score = max(0.0, min(1.0, 0.5 + 0.2*sp + 0.05*slope))
-        if openpos is None:
-            want_long  = (c>vw and e9>e21 and rsi>45)
-            want_short = (c<vw and e9<e21 and rsi<55)
-            okL, okS = htf_ok(i)
-            side=None
-            if want_long and okL and score>=AI_THRESHOLD:
-                side="LONG"
-            elif want_short and okS and score>=AI_THRESHOLD:
-                side="SHORT"
-            if side:
-                entry=c
-                slp = min(SL_CAP_MAX, SL_CAP_BASE+SL_CUSHION)
-                if side=="LONG":
-                    slv=entry-slp; tp1=entry+TP1_DOLLARS; tp2v=entry+TP2_DOLLARS
-                else:
-                    slv=entry+slp; tp1=entry-TP1_DOLLARS; tp2v=entry-TP2_DOLLARS
-                openpos={"side":side,"entry":entry,"sl":slv,"tp1":tp1,"tp2":tp2v,"tp1_hit":False,"bars":0}
-                entries+=1
-                lines.append(f"{entries:02d}. {side} @ {entry:.0f} → OPEN in 0 bars")
-        else:
-            px=c
-            side=openpos["side"]
-            if side=="LONG":
-                if px>=openpos["tp1"] and not openpos["tp1_hit"]:
-                    openpos["tp1_hit"]=True
-                if px>=openpos["tp2"]:
-                    wins+=1; tp2+=1; lines.append(f"{entries:02d}. {side} @ {openpos['entry']:.0f} → TP2 in {openpos['bars']} bars")
-                    openpos=None; continue
-                if px<=openpos["sl"]:
-                    sl+=1; lines.append(f"{entries:02d}. {side} @ {openpos['entry']:.0f} → SL in {openpos['bars']} bars")
-                    openpos=None; continue
-            else:
-                if px<=openpos["tp1"] and not openpos["tp1_hit"]:
-                    openpos["tp1_hit"]=True
-                if px<=openpos["tp2"]:
-                    wins+=1; tp2+=1; lines.append(f"{entries:02d}. {side} @ {openpos['entry']:.0f} → TP2 in {openpos['bars']} bars")
-                    openpos=None; continue
-                if px>=openpos["sl"]:
-                    sl+=1; lines.append(f"{entries:02d}. {side} @ {openpos['entry']:.0f} → SL in {openpos['bars']} bars")
-                    openpos=None; continue
-            openpos["bars"]+=1
+    for r in rows[-n:]:
+        t = r.get("time","")
+        s = r.get("side","")
+        p = r.get("price","")
+        o = r.get("outcome","OPEN")
+        lines.append(f"{t} {s.upper()} @ {p} → {o}")
+    return "Last trades:\n" + "\n".join(lines)
 
-    header=f"🧪 Backtest ({days}d, 5m): {entries} entries | Wins {wins} | TP2 {tp2} | SL {sl}"
-    if not entries:
-        return header + "\n(no qualifying entries)"
-    return header + "\n" + "\n".join(lines[:50])  # clip
-
-def get_ai_status():
-    # Show AI persistence knobs if file exists
-    path = os.getenv("AI_STATE_FILE", "ai_state.json")
-    if os.path.exists(path):
-        try:
-            data = json.load(open(path,"r"))
-            return f"🤖 AI state: streak={data.get('sl_streak')} caution={data.get('caution_multiplier')} explore={data.get('exploration')}"
-        except Exception:
-            pass
-    return "🤖 AI state: default (no file yet)"
+def get_results() -> str:
+    rows = _load_logs()
+    if not rows:
+        return "[0, 0, 0, 0]"
+    wins = sum(1 for r in rows if r.get("outcome") in ("TP1","TP2"))
+    tp2  = sum(1 for r in rows if r.get("outcome") == "TP2")
+    sls  = sum(1 for r in rows if r.get("outcome") == "SL")
+    total = len(rows)
+    return json.dumps([total, wins, tp2, sls])
