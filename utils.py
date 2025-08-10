@@ -113,41 +113,60 @@ def get_bot_status():
     )
 
 # ---------- DATA ----------
-MEXC_V3 = "https://www.mexc.com/api/v3/klines"   # works like Binance
+MEXC_SYMBOL = "BTCUSDT"
 
-def _interval_ok(tf: str) -> bool:
-    return tf in ("1m","5m","15m","30m","1h","4h","1d")
+_MEXC_TF_MAP = {
+    "1m": "1m",
+    "3m": "3m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "45m": "1h",   # if asked 45m, old bot mapped to 1h
+    "1h": "1h",
+}
+def _mexc_interval(tf: str) -> str:
+    return _MEXC_TF_MAP.get(tf, "5m")
 
-def fetch_mexc(tf="5m", limit=500) -> pd.DataFrame | None:
-    if not _interval_ok(tf): return None
-    try:
-        params = {"symbol": SYMBOL, "interval": tf, "limit": min(1000, int(limit))}
-        r = requests.get(MEXC_V3, params=params, timeout=10)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if not isinstance(data, list) or len(data) == 0:
-            return None
-        cols = ["open_time","open","high","low","close","volume","close_time","qav"]
-        rows = []
-        for k in data:
-            rows.append([k[0], float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]), k[6], float(k[7]) if len(k)>7 else 0.0])
-        df = pd.DataFrame(rows, columns=cols)
-        df["time"] = pd.to_datetime(df["open_time"], unit="ms")
-        df.set_index("time", inplace=True)
-        return df[["open","high","low","close","volume"]].astype(float)
-    except Exception:
-        return None
+def fetch_mexc(tf: str = "5m", limit: int = 1000):
+    """
+    MEXC v3 klines — same behavior as your old Spiral bot.
+    Returns a DataFrame with index=UTC ts and columns: open, high, low, close, volume.
+    """
+    url = "https://api.mexc.com/api/v3/klines"
+    params = {
+        "symbol": MEXC_SYMBOL,
+        "interval": _mexc_interval(tf),
+        "limit": int(limit)
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (SpiralBot)",
+        "Accept": "application/json"
+    }
 
-def diag_data():
-    parts = []
-    for tf in TF_LIST:
-        d = fetch_mexc(tf, limit=200)
-        if d is None:
-            parts.append(f"{tf}: None")
-        else:
-            parts.append(f"{tf}: {len(d)} bars, last={d.index[-1]}")
-    return "📡 MEXC diag\n" + "\n".join(parts)
+    for _ in range(4):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=12)
+            if r.status_code != 200:
+                time.sleep(0.6); continue
+            data = r.json()
+            if not isinstance(data, list) or len(data) < 5:
+                time.sleep(0.5); continue
+
+            # MEXC array: [ open_time, open, high, low, close, volume, close_time, ... ]
+            cols = ["open_time","open","high","low","close","volume"]
+            kl = [row[:6] for row in data]
+            df = pd.DataFrame(kl, columns=cols)
+            for c in ["open","high","low","close","volume"]: df[c]=df[c].astype(float)
+            df["ts"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+            df.set_index("ts", inplace=True)
+            return df[["open","high","low","close","volume"]]
+        except Exception:
+            time.sleep(0.6)
+    return None
+
+def check_data_source():
+    df = fetch_mexc("5m", limit=200)
+    return "✅ MEXC OK" if (df is not None and len(df)>0) else "❌ MEXC FAIL"
 
 # ---------- INDICATORS ----------
 def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
