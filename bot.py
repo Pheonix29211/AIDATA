@@ -1,91 +1,79 @@
-# bot.py
 import os
-import logging
 from flask import Flask, request
 from telegram import Bot, Update
 from telegram.ext import Dispatcher, CommandHandler, CallbackContext
 
-# --- Logging ---
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("spiralbot")
+from utils import (
+    scan_market, diag_data, run_backtest, get_bot_status,
+    get_results, get_trade_logs, start_background, get_ai_status
+)
 
-# --- Utils (required) ---
-from utils import scan_market, diag_data, run_backtest, get_bot_status, get_results, get_trade_logs, get_ai_status
+TOKEN = os.getenv("BOT_TOKEN")
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
+HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+WEBHOOK_URL = f"https://{HOST}/{TOKEN}"
+PORT = int(os.getenv("PORT", "10000"))
 
-# --- Config from env ---
-TOKEN = os.getenv("BOT_TOKEN")  # Telegram bot token
-if not TOKEN:
-    raise SystemExit("❌ BOT_TOKEN is missing in environment.")
-
-HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")  # e.g. myapp.onrender.com
-PORT = int(os.environ.get("PORT", 10000))         # Render provides PORT
-WEBHOOK_URL = f"https://{HOSTNAME}/{TOKEN}" if HOSTNAME else None
-
-# --- Telegram objects ---
 bot = Bot(token=TOKEN)
 app = Flask(__name__)
 dispatcher = Dispatcher(bot=bot, update_queue=None, workers=4, use_context=True)
 
-# --- Helpers ---
-def send_long(chat_id: int, text: str):
-    """Split long messages to fit Telegram limits."""
-    if not text:
-        return
-    MAX = 3800
-    for i in range(0, len(text), MAX):
-        bot.send_message(chat_id=chat_id, text=text[i:i+MAX])
+# ------------- helpers -------------
+def _send_long(chat_id, text):
+    # Telegram hard limit ~4096 chars
+    chunk = 3800
+    if len(text) <= chunk:
+        bot.send_message(chat_id=chat_id, text=text)
+    else:
+        for i in range(0, len(text), chunk):
+            bot.send_message(chat_id=chat_id, text=text[i:i+chunk])
 
-# --- Commands ---
+# ------------- commands -------------
 def start(update: Update, context: CallbackContext):
-    update.message.reply_text("🌀 SpiralBot Online! Use /menu to see options.")
+    update.message.reply_text("🌀 SpiralBot online. Use /menu")
 
 def menu(update: Update, context: CallbackContext):
-    txt = (
-        "🌀 SpiralBot Menu:\n"
+    update.message.reply_text(
+        "🌀 Menu:\n"
         "/scan — Manual scan\n"
-        "/forcescan — Force scan now\n"
+        "/forcescan — Force data + scan now\n"
         "/diag — Data source diagnostics\n"
-        "/status — Current logic\n"
-        "/results — Win stats\n"
-        "/logs — Last trades\n"
-        "/backtest — 2-day backtest (or /backtest 3)\n"
+        "/status — Current logic + open trade\n"
+        "/results — Win/SL summary\n"
+        "/logs — Last 30 trade events\n"
+        "/backtest — 2-day 5m backtest\n"
+        "/ai — AI state"
     )
-    update.message.reply_text(txt)
 
 def scan_command(update: Update, context: CallbackContext):
-    head, details = scan_market()
-    send_long(update.effective_chat.id, f"{head}\n{details}")
+    msg, _ = scan_market()
+    update.message.reply_text(msg)
 
 def forcescan_command(update: Update, context: CallbackContext):
-    head, details = scan_market()
-    send_long(update.effective_chat.id, f"📡 Force Scan Result:\n{head}\n{details}")
+    # Same as /scan but we surface errors directly
+    msg, _ = scan_market()
+    update.message.reply_text(f"📡 Force Scan Result:\n{msg}")
 
 def diag_command(update: Update, context: CallbackContext):
-    send_long(update.effective_chat.id, diag_data())
+    msg, _ = diag_data()
+    update.message.reply_text(msg)
 
 def status_command(update: Update, context: CallbackContext):
-    base = get_bot_status()
-    ai   = get_ai_status()
-    send_long(update.effective_chat.id, base + "\n" + ai)
+    update.message.reply_text(get_bot_status())
 
 def results_command(update: Update, context: CallbackContext):
-    send_long(update.effective_chat.id, get_results())
+    update.message.reply_text(get_results())
 
 def logs_command(update: Update, context: CallbackContext):
-    send_long(update.effective_chat.id, get_trade_logs())
+    _send_long(update.message.chat_id, get_trade_logs(30))
 
 def backtest_command(update: Update, context: CallbackContext):
-    # /backtest or /backtest N
-    days = 2
-    try:
-        if context.args and len(context.args) >= 1:
-            days = max(1, min(7, int(context.args[0])))
-    except Exception:
-        pass
-    head, details = run_backtest(days=days)
-    send_long(update.effective_chat.id, f"{head}\n{details}")
+    _send_long(update.message.chat_id, run_backtest(days=2))
 
-# --- Register handlers ---
+def ai_command(update: Update, context: CallbackContext):
+    update.message.reply_text(get_ai_status())
+
+# register
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(CommandHandler("menu", menu))
 dispatcher.add_handler(CommandHandler("scan", scan_command))
@@ -95,26 +83,27 @@ dispatcher.add_handler(CommandHandler("status", status_command))
 dispatcher.add_handler(CommandHandler("results", results_command))
 dispatcher.add_handler(CommandHandler("logs", logs_command))
 dispatcher.add_handler(CommandHandler("backtest", backtest_command))
+dispatcher.add_handler(CommandHandler("ai", ai_command))
 
-# --- Webhook routes ---
-@app.route(f'/{TOKEN}', methods=['POST'])
+# webhook routes
+@app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
-    try:
-        update = Update.de_json(request.get_json(force=True), bot)
-        dispatcher.process_update(update)
-    except Exception as e:
-        log.exception("Error processing update: %s", e)
+    update = Update.de_json(request.get_json(force=True), bot)
+    dispatcher.process_update(update)
     return "ok"
 
-@app.route('/')
+@app.route("/")
 def index():
     return "🌀 SpiralBot Running"
 
-# --- Entrypoint ---
 if __name__ == "__main__":
-    if WEBHOOK_URL:
-        bot.set_webhook(WEBHOOK_URL)
-        log.info("✅ Webhook set: %s", WEBHOOK_URL)
-    else:
-        log.warning("⚠️ RENDER_EXTERNAL_HOSTNAME not set; webhook URL not configured.")
+    # set webhook
+    bot.set_webhook(WEBHOOK_URL)
+    # start background momentum/manager loop
+    try:
+        if OWNER_CHAT_ID:
+            start_background(bot)
+    except Exception:
+        pass
+    # run flask
     app.run(host="0.0.0.0", port=PORT)
