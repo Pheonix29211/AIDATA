@@ -1,4 +1,4 @@
-# utils.py — MEXC-only data, indicators, AI gate, risk/TP/SL, learning, scan API
+# utils.py — MEXC-only data (old working style), indicators, AI gate, risk/TP/SL, learning, scan API
 import os, time, json, math, re, requests
 import pandas as pd
 from datetime import datetime, timezone
@@ -59,7 +59,7 @@ loss_dollars_today = 0.0
 _last_tf = None
 last_reset_day = None
 
-# ==== HELPERS ====
+# ===== time helpers =====
 def _now_utc(): return datetime.now(timezone.utc)
 def _day_key(dt): return dt.strftime("%Y-%m-%d")
 
@@ -76,44 +76,60 @@ def _session_from_hour(h):
     if 16 <= h < 20:  return "ny"
     return "late"
 
-# ===== MEXC (Spiral-style, fixed BTCUSDT) =====
+# ===== MEXC (EXACT like your old working bot; BTCUSDT spot) =====
 MEXC_SYMBOL = "BTCUSDT"
-_MEXC_TF_MAP = {
-    "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m","45m":"1h","1h":"1h"
-}
-def _mexc_interval(tf: str) -> str: return _MEXC_TF_MAP.get(tf,"5m")
 
-def fetch_mexc(tf="5m", limit=1000):
+_MEXC_TF_MAP = {
+    "1m": "1m",
+    "3m": "3m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "45m": "1h",   # if asked 45m, old bot mapped to 1h
+    "1h": "1h",
+}
+def _mexc_interval(tf: str) -> str:
+    return _MEXC_TF_MAP.get(tf, "5m")
+
+def fetch_mexc(tf: str = "5m", limit: int = 1000):
     """
-    Request many bars + handle rate limits / HTML gracefully.
+    MEXC v3 klines — same behavior as your old Spiral bot.
+    Returns a DataFrame with index=UTC ts and columns: open, high, low, close, volume.
     """
     url = "https://api.mexc.com/api/v3/klines"
-    params = {"symbol": MEXC_SYMBOL, "interval": _mexc_interval(tf), "limit": int(limit)}
-    headers = {"User-Agent":"Mozilla/5.0 (SpiralBot)","Accept":"application/json"}
+    params = {
+        "symbol": MEXC_SYMBOL,
+        "interval": _mexc_interval(tf),
+        "limit": int(limit)
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (SpiralBot)",
+        "Accept": "application/json"
+    }
+
     for _ in range(4):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=12)
             if r.status_code != 200:
-                time.sleep(0.8); continue
-            try:
-                raw = r.json()
-            except Exception:
-                time.sleep(0.8); continue
-            if not isinstance(raw, list) or len(raw)==0:
+                time.sleep(0.6); continue
+            data = r.json()
+            if not isinstance(data, list) or len(data) < 5:
                 time.sleep(0.5); continue
-            cols = ["open_time","open","high","low","close","volume",
-                    "close_time","qa","tbv","tq","ig1","ig2"]
-            df = pd.DataFrame(raw, columns=cols[:6])
+
+            # MEXC array: [ open_time, open, high, low, close, volume, close_time, ... ]
+            cols = ["open_time","open","high","low","close","volume"]
+            kl = [row[:6] for row in data]
+            df = pd.DataFrame(kl, columns=cols)
             for c in ["open","high","low","close","volume"]: df[c]=df[c].astype(float)
             df["ts"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
             df.set_index("ts", inplace=True)
             return df[["open","high","low","close","volume"]]
         except Exception:
-            time.sleep(0.8)
+            time.sleep(0.6)
     return None
 
 def check_data_source():
-    df = fetch_mexc("5m", limit=120)
+    df = fetch_mexc("5m", limit=200)
     return "✅ MEXC OK" if (df is not None and len(df)>0) else "❌ MEXC FAIL"
 
 # ==== INDICATORS ====
@@ -194,14 +210,14 @@ def build_features(z, session):
         "hour_sin": hs, "hour_cos": hc, "dow_sin": ds, "dow_cos": dc
     }
 
-# ==== TF chooser (hysteresis) ====
+# ==== TF chooser (hysteresis) — MEXC-only ====
 def choose_tf():
     global _last_tf
     session = _session_from_hour(_now_utc().hour)
     best = None; best_p = -9; best_row = None
     for tf in TF_LIST:
         df = fetch_mexc(tf, limit=1000)
-        if df is None or len(df) < 30:   # relaxed from 60
+        if df is None or len(df) < 30:   # tolerant
             continue
         df = compute_indicators(df)
         z = df.iloc[-1]
